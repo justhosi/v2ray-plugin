@@ -1,0 +1,18 @@
+# The plugin has no build step and no dependencies — everything here is source.
+# These entries only guard against accidental local clutter.
+
+# Editor / OS noise
+*~
+*.swp
+.DS_Store
+
+# Never commit real secrets. v2ray profiles (with your UUID) live in
+# ~/.config/omarchy-v2ray/, but people have a habit of dropping a stray copy
+# next to the code while testing. Keep them out of history.
+profiles/
+*.meta.json
+*.config.json
+payload.json
+
+# Local scratch
+/tmp/

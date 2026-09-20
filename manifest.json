@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "community.v2ray-client",
+  "name": "v2ray Client",
+  "version": "0.1.0",
+  "author": "Hossein Mazinan",
+  "license": "MIT",
+  "description": "Paste a vless:// vmess:// trojan:// or ss:// share link to import a server, then connect, disconnect, switch, and measure latency from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "v2ray Client",
+    "description": "Import a v2ray share link and control the tunnel.",
+    "category": "Network",
+    "aliases": [
+      "v2ray",
+      "xray",
+      "proxy",
+      "vpn"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 30,
+      "socksPort": 10808,
+      "httpPort": 10809
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "socksPort",
+        "type": "integer",
+        "label": "Local SOCKS port",
+        "min": 1024,
+        "max": 65535,
+        "step": 1,
+        "defaultValue": 10808
+      },
+      {
+        "key": "httpPort",
+        "type": "integer",
+        "label": "Local HTTP port",
+        "min": 1024,
+        "max": 65535,
+        "step": 1,
+        "defaultValue": 10809
+      }
+    ]
+  }
+}

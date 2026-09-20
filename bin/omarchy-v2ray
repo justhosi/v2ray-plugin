@@ -1,0 +1,1327 @@
+#!/bin/bash
+# =============================================================================
+# omarchy-v2ray — backend CLI for the Omarchy "v2ray Client" bar plugin.
+# =============================================================================
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# A Quickshell bar plugin runs inside the long-lived `omarchy-shell` process, as
+# the desktop user, with no TTY and no way to type a password. That makes it a
+# terrible place to keep process-management logic:
+#
+#   * every command must be non-interactive,
+#   * a crash inside QML takes the whole bar down with it,
+#   * you cannot test QML from a terminal.
+#
+# So the plugin's QML stays thin (draw an icon, show a list) and *all* of the
+# risky work — parsing, writing files, starting/stopping the engine, measuring
+# latency — lives here, where you can run it by hand and read the output.
+#
+# This script prints JSON on stdout for every subcommand, so the QML side can
+# `JSON.parse()` the result without guessing at formats.
+#
+# NOTHING IN HERE NEEDS ROOT. The engine runs as a plain user process listening
+# on 127.0.0.1. See README.md for the TUN-mode caveat.
+#
+# LAYOUT ON DISK
+# --------------
+#   ~/.config/omarchy-v2ray/
+#   ├── profiles/
+#   │   ├── <id>.meta.json     # display name, type, host, ports, original link
+#   │   └── <id>.config.json   # the real xray/v2ray config (mode 0600!)
+#   └── state/
+#       ├── engine.pid         # PID of the running engine
+#       ├── engine.log         # engine stdout+stderr
+#       ├── active.id          # profile id currently connected
+#       ├── started.epoch      # unix time the tunnel came up
+#       └── autostart.id       # profile to auto-connect on shell start
+#
+# The two files are split on purpose: the config holds the secret UUID, the
+# meta file holds everything safe to show in the UI (and to copy/paste).
+#
+# SUBCOMMANDS
+# -----------
+#   status              Engine/profile/connection state as one JSON object.
+#   list                Every imported profile as a JSON array.
+#   import              Read {id,meta,config} JSON on stdin, write a profile.
+#   remove <id>         Delete a profile (and disconnect it if it was active).
+#   start <id>          Launch the engine against a profile.
+#   stop                Stop the engine.
+#   toggle              Stop if running, otherwise start the autostart profile.
+#   restart <id>        Convenience: stop then start.
+#   ping <id>           Real latency through a temporary engine on a spare port.
+#   link <id>           Print the original share link.
+#   log [lines]         Tail the engine log (default 30 lines).
+#   autostart [<id>|off] Get or set the profile that auto-connects.
+#   install-engine      Open a floating terminal that installs v2ray.
+#   install-xray        Open a floating terminal that installs xray from the AUR.
+#   debug <id>          Verbose one-shot diagnosis: run the engine at debug
+#                       level, make one request, print the engine's own log.
+#   reveal              Open the config directory in the file manager.
+#   version             Print this script's version.
+#
+# EXIT CODES
+# ----------
+#   0  success            (stdout is valid JSON)
+#   1  expected failure   (stdout is {"ok":false,"error":"..."} — never stderr,
+#                          so the QML caller can always parse one place)
+#
+# =============================================================================
+
+# `-u` catches typos in variable names; `pipefail` makes a failing command
+# inside a pipeline fail the whole pipeline. We deliberately do NOT use `-e`,
+# because many subcommands must inspect a non-zero exit code and keep going.
+set -uo pipefail
+
+VERSION="0.1.0"
+
+# -----------------------------------------------------------------------------
+# Paths. Everything overridable via environment so tests can use a temp dir
+# without touching the user's real profiles.
+# -----------------------------------------------------------------------------
+CONFIG_DIR="${OMARCHY_V2RAY_HOME:-$HOME/.config/omarchy-v2ray}"
+PROFILES_DIR="$CONFIG_DIR/profiles"
+STATE_DIR="$CONFIG_DIR/state"
+PID_FILE="$STATE_DIR/engine.pid"
+LOG_FILE="$STATE_DIR/engine.log"
+ACTIVE_FILE="$STATE_DIR/active.id"
+STARTED_FILE="$STATE_DIR/started.epoch"
+AUTOSTART_FILE="$STATE_DIR/autostart.id"
+
+# Default local proxy ports. The panel can override these per import through the
+# widget settings; these are only the fallback.
+DEFAULT_SOCKS_PORT="${OMARCHY_V2RAY_SOCKS_PORT:-10808}"
+DEFAULT_HTTP_PORT="${OMARCHY_V2RAY_HTTP_PORT:-10809}"
+
+# Host used for the latency probe. A 204-responder is ideal: tiny body, never
+# cached by proxies, and reachable from essentially anywhere.
+PING_URL="${OMARCHY_V2RAY_PING_URL:-https://www.gstatic.com/generate_204}"
+# The host whose HTTP Date header the debug command uses to measure clock
+# drift. Any well-connected TLS host does; this one is just reliably up.
+PING_HOST_FOR_CLOCK="${OMARCHY_V2RAY_CLOCK_URL:-www.cloudflare.com}"
+PING_TIMEOUT="${OMARCHY_V2RAY_PING_TIMEOUT:-8}"
+# The debug command gives the dial more room than the ping does: a slow or
+# filtered route should be *reported*, not cut off before it can fail.
+DEBUG_TIMEOUT="${OMARCHY_V2RAY_DEBUG_TIMEOUT:-12}"
+
+# -----------------------------------------------------------------------------
+# Output helpers.
+#
+# Every failure path goes through emit_error so the contract "stdout is always
+# parseable JSON" holds even for silly mistakes like a missing argument.
+# -----------------------------------------------------------------------------
+emit_error() {
+  # $1 = human-readable message
+  jq -n --arg error "$1" '{ok: false, error: $error}'
+  exit 1
+}
+
+emit_ok() {
+  # $1 = optional JSON object built by the caller (already a string)
+  if [[ -n ${1:-} ]]; then printf '%s\n' "$1"; else echo '{"ok": true}'; fi
+  exit 0
+}
+
+ensure_dirs() {
+  mkdir -p "$PROFILES_DIR" "$STATE_DIR"
+  # umask 077 => new files are 0600 and new dirs 0700, so the UUID inside a
+  # config is never world-readable.
+  umask 077
+}
+
+# -----------------------------------------------------------------------------
+# Small utilities.
+# -----------------------------------------------------------------------------
+
+# engine_bin — echo the name of an installed v2ray-family core, or nothing.
+#
+# Preference order and WHY:
+#
+#   1. xray   — actively-developed core; its config schema is a superset of
+#               v2ray-core's for everything we generate, and it is the only one
+#               of the two that understands REALITY, XHTTP and the Vision flow
+#               control. NOT in Arch's official repos: it lives in the AUR
+#               (install with `yay -S xray` or `omarchy pkg aur add xray`).
+#               We only *prefer* it when the user already has it.
+#
+#   2. v2ray  — Arch's official `extra/v2ray` package. This is what
+#               `install-engine` below installs, because the official repos are
+#               always reachable and need no AUR helper. It speaks VLESS/Trojan/
+#               Shadowsocks and (on plain TLS) everything the basic link types
+#               need — just not REALITY/XHTTP.
+engine_bin() {
+  if command -v xray >/dev/null 2>&1; then
+    echo "xray"
+  elif command -v v2ray >/dev/null 2>&1; then
+    echo "v2ray"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# xray_only_features ID — name the link features this profile needs that
+# v2ray-core cannot do, or print nothing when v2ray can handle the profile.
+# -----------------------------------------------------------------------------
+# WHY THIS EXISTS (the failure it prevents is genuinely confusing):
+#
+#   v2ray-core does NOT implement REALITY or XHTTP. It does not reject them
+#   either — `streamSettings.security` is only a string to its config parser, so
+#   a config with security:"reality" is accepted as "Configuration OK" and then
+#   the engine simply dials the server in the clear. The REALITY server never
+#   answers, the SOCKS port stays silent, and every layer above reports the only
+#   thing it can see: "the tunnel did not answer (bad UUID, wrong server, or
+#   blocked port)" — for a link that works fine in the user's phone client.
+#
+#   So we refuse *before* starting, and we name the actual fix.
+xray_only_features() {
+  local meta
+  meta="$(meta_path "$1")"
+  [[ -f $meta ]] || return 0
+
+  local features="" security network
+  security="$(jq -r '.security // ""' "$meta" 2>/dev/null)"
+  network="$(jq -r '.network // ""' "$meta" 2>/dev/null)"
+
+  [[ $security == "reality" ]] && features="REALITY"
+  # v2ray-core has no xhttp/splithttp transport; xray added both.
+  if [[ $network == "xhttp" || $network == "splithttp" ]]; then
+    features="${features:+$features + }XHTTP"
+  fi
+
+  printf '%s' "$features"
+}
+
+# -----------------------------------------------------------------------------
+# require_capable_engine ID ENGINE — refuse early when the installed core is the
+# wrong one. Prints the JSON error and returns 1 when the profile cannot work,
+# returns 0 when we may proceed.
+# -----------------------------------------------------------------------------
+require_capable_engine() {
+  local id="$1" engine="$2"
+  # xray is a superset: it runs everything we generate, so nothing to check.
+  [[ $engine == "xray" ]] && return 0
+
+  local missing
+  missing="$(xray_only_features "$id")"
+  [[ -z $missing ]] && return 0
+
+  jq -n --arg e "This server needs $missing, which only the xray core supports — v2ray cannot do it. Install xray with: omarchy pkg aur add xray" \
+        '{ok:false, error:$e, needsXray:true}'
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# probe_cert HOST PORT SNI — "subject=... issuer=..." for the certificate a TLS
+# server presents for that SNI, or an empty string if openssl is missing / the
+# connection failed.
+# -----------------------------------------------------------------------------
+# WHY: REALITY clients log "received real certificate (potential MITM or
+# redirection)" whenever the handshake is not authenticated. That single message
+# covers four very different situations, and this probe separates them:
+#
+#   * we reached the real server and it declined our REALITY auth, or
+#   * something on the network path answered instead of the server.
+#
+# Comparing the certificate a server IP shows against the one the *real* domain
+# shows is the cheapest way to tell those apart.
+probe_cert() {
+  command -v openssl >/dev/null 2>&1 || return 0
+  local host="$1" port="$2" sni="$3"
+  [[ -n $host && -n $port && -n $sni ]] || return 0
+  local out
+  out="$(timeout 12 openssl s_client -connect "$host:$port" -servername "$sni" -alpn http/1.1 \
+        </dev/null 2>/dev/null \
+        | openssl x509 -noout -subject -issuer 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g;s/ *$//')"
+  printf '%s' "$out"
+}
+
+# -----------------------------------------------------------------------------
+# ca_of "subject=CN=www.google.com issuer=C=US, O=Google Trust Services, CN=WE2"
+#       -> "Google Trust Services"
+# -----------------------------------------------------------------------------
+# WHY: the "the server is declining us" vs "someone is intercepting us" diagnosis
+# works by comparing the certificate a server IP shows with the one the genuine
+# domain shows. Neither the SUBJECT nor the ISSUER can be compared verbatim:
+#
+#   * the subject is identical anyway (CN=www.google.com), so it proves nothing;
+#   * the issuer is legitimately different between datacenters — Google signs with
+#     several certificate authorities and the "CN=" of the issuer names the FRONT
+#     that served you (GTS WE2, GTS WR2, ...), which changes as you roam between
+#     networks and even between requests.
+#
+# Comparing the full string therefore produced a false "MISMATCH — someone is
+# intercepting you!" on connections that were in fact perfectly healthy. What DOES
+# identify the signer is the issuer ORGANISATION ("O=Google Trust Services"), so
+# that is what this returns. When a certificate has no organisation field we fall
+# back to the raw issuer text, which is still better than nothing.
+ca_of() {
+  local raw
+  raw="$(printf '%s' "$1" | sed -n 's/.*issuer=//p')"
+  [[ -n $raw ]] || return 0
+  local org
+  org="$(printf '%s' "$raw" | sed -n 's/.*O=\([^,]*\).*/\1/p')"
+  if [[ -n $org ]]; then printf '%s' "$org"; else printf '%s' "$raw"; fi
+}
+
+# -----------------------------------------------------------------------------
+# clock_skew_seconds — local time minus the time reported by a TLS server we
+# reach directly. Empty when unavailable.
+# -----------------------------------------------------------------------------
+# WHY: REALITY authenticates each client with an embedded timestamp. A server
+# configured with a non-zero maxTimeDiff silently rejects clients whose clock is
+# too far off, and the client only ever sees "received real certificate". A few
+# minutes of drift is therefore enough to break REALITY while every other
+# protocol keeps working.
+clock_skew_seconds() {
+  local domain="${1:-www.google.com}"
+  local local_epoch remote_header remote_epoch
+  local_epoch="$(date +%s)"
+  remote_header="$(curl -sI --max-time 8 "https://$domain" 2>/dev/null \
+    | grep -i '^date:' | head -1 | cut -d' ' -f2-)"
+  [[ -n $remote_header ]] || return 0
+  remote_epoch="$(date -u -d "$remote_header" +%s 2>/dev/null)"
+  [[ -n $remote_epoch ]] || return 0
+  printf '%s' "$((local_epoch - remote_epoch))"
+}
+
+# port_listening PORT — true when something is listening on a local TCP port.
+# Uses `ss` (always present with iproute2) rather than /dev/tcp, because this
+# script may run under `dash`-like shells in the future and ss is cheaper.
+port_listening() {
+  ss -Hltn "sport = :$1" 2>/dev/null | grep -q .
+}
+
+# process_alive PID — true when the PID exists and is signalable.
+process_alive() {
+  [[ -n ${1:-} ]] && kill -0 "$1" 2>/dev/null
+}
+
+# read_pid — echo the recorded engine PID, cleaning up a stale file.
+read_pid() {
+  local pid=""
+  [[ -f $PID_FILE ]] && pid="$(tr -dc '0-9' <"$PID_FILE")"
+  if process_alive "$pid"; then
+    echo "$pid"
+  else
+    rm -f "$PID_FILE"
+    echo ""
+  fi
+}
+
+# free_port — find an unused local TCP port for a throwaway engine.
+# We start at 11080 to stay clear of the real proxy ports (10808/10809).
+free_port() {
+  local candidate
+  for candidate in $(seq 11080 11160); do
+    if ! port_listening "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  echo 11080
+}
+
+# config_path ID / meta_path ID — build the two file paths for a profile.
+config_path() { echo "$PROFILES_DIR/$1.config.json"; }
+meta_path() { echo "$PROFILES_DIR/$1.meta.json"; }
+
+# profile_exists ID — true when both halves of a profile are present.
+profile_exists() {
+  [[ -f "$(meta_path "$1")" && -f "$(config_path "$1")" ]]
+}
+
+# last_log_lines COUNT — the tail of the engine log, flattened to one line so
+# it can be embedded in a JSON error message.
+# last_log_lines [COUNT] [FILE] — flatten the last COUNT lines of an engine log
+# into one line, for stuffing into a JSON error message.
+#
+# BUG FIX: this used to read only $LOG_FILE. `ping` runs its throwaway engine
+# with output going to a mktemp file instead, so every failed probe reported an
+# empty detail — which is precisely the case where the engine's own words matter
+# most. The file is now a parameter, and callers that use a temp log must pass it
+# BEFORE they delete it.
+last_log_lines() {
+  local count="${1:-4}"
+  local file="${2:-$LOG_FILE}"
+  [[ -f $file ]] || { echo ""; return 0; }
+  # Collapse runs of the SAME message before flattening. A failing REALITY probe
+  # retries about once a second and the engine prints that one sentence every
+  # time, so a naive tail produced four copies — which is what made the popup
+  # unreadable and the bug report useless.
+  #
+  # The messages are NOT byte-identical though: xray prefixes every line with its
+  # own timestamp and goroutine id, and both change on every retry. So the
+  # comparison uses a NORMALISED key with the timestamp and [id] stripped; when a
+  # run repeats, the first copy is printed verbatim and the count goes in
+  # brackets. Only the text of the first line is kept, so a genuinely different
+  # second message still shows up on its own.
+  tail -n "$count" "$file" \
+    | awk '
+        {
+          key = $0
+          sub(/^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9:.]+ /, "", key)
+          sub(/\[[0-9]+\] /, "", key)
+          if (key == prevkey) { n++; next }
+          if (prevkey != "") print (n > 1 ? prev "  [repeated " n " times]" : prev)
+          prev = $0; prevkey = key; n = 1
+        }
+        END { if (prevkey != "") print (n > 1 ? prev "  [repeated " n " times]" : prev) }
+      ' \
+    | tr '\n' ' ' \
+    | sed 's/  */ /g;s/ *$//'
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: status
+# -----------------------------------------------------------------------------
+# This is the single call the panel makes on its refresh timer. It answers, in
+# one round trip: is a core installed, is the engine up, which profile is
+# connected, on which ports, and for how long.
+cmd_status() {
+  ensure_dirs
+  local engine installed=false running=false listening=false
+  local pid active_id active_name="" socks="" http="" uptime=0 autostart=""
+  local started=0 now=0
+
+  engine="$(engine_bin)"
+  [[ -n $engine ]] && installed=true
+
+  pid="$(read_pid)"
+  active_id="$( [[ -f $ACTIVE_FILE ]] && tr -d '\n' <"$ACTIVE_FILE" || echo "" )"
+  autostart="$( [[ -f $AUTOSTART_FILE ]] && tr -d '\n' <"$AUTOSTART_FILE" || echo "" )"
+
+  if [[ -n $pid ]]; then
+    running=true
+    if [[ -n $active_id && -f "$(config_path "$active_id")" ]]; then
+      # Ports are read back from the profile that is actually running, so the
+      # UI can show "SOCKS 127.0.0.1:10808" without duplicating our defaults.
+      socks="$(jq -r '.inbounds[0].port // empty' "$(config_path "$active_id")" 2>/dev/null)"
+      http="$(jq -r '.inbounds[1].port // empty' "$(config_path "$active_id")" 2>/dev/null)"
+    fi
+    listening=false
+    [[ -n $socks ]] && port_listening "$socks" && listening=true
+    [[ -f $STARTED_FILE ]] && started="$(tr -dc '0-9' <"$STARTED_FILE")"
+    now="$(date +%s)"
+    [[ -n $started ]] && uptime=$((now - started))
+  else
+    running=false
+  fi
+
+  if [[ -n $active_id && -f "$(meta_path "$active_id")" ]]; then
+    active_name="$(jq -r '.name // ""' "$(meta_path "$active_id")" 2>/dev/null)"
+  fi
+
+  jq -n \
+    --argjson installed "$installed" \
+    --arg engine "$engine" \
+    --argjson running "$running" \
+    --argjson listening "$listening" \
+    --arg pid "$pid" \
+    --arg activeId "$active_id" \
+    --arg activeName "$active_name" \
+    --arg socksPort "$socks" \
+    --arg httpPort "$http" \
+    --argjson uptimeSec "$uptime" \
+    --arg autostartId "$autostart" \
+    --arg logTail "$(last_log_lines 3)" \
+    '{
+       ok: true,
+       installed: $installed,
+       engine: $engine,
+       running: $running,
+       listening: $listening,
+       pid: $pid,
+       activeId: $activeId,
+       activeName: $activeName,
+       socksPort: (if $socksPort == "" then null else ($socksPort | tonumber) end),
+       httpPort: (if $httpPort == "" then null else ($httpPort | tonumber) end),
+       uptimeSec: $uptimeSec,
+       autostartId: $autostartId,
+       logTail: $logTail
+     }'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: list
+# -----------------------------------------------------------------------------
+# Deliberately includes `link`: the panel offers a "copy link" action, and the
+# data never leaves the user's own machine. Everything else comes from the meta
+# file, so this stays a pure read — no engine involved, works while offline.
+cmd_list() {
+  ensure_dirs
+  shopt -s nullglob
+  local metas=("$PROFILES_DIR"/*.meta.json)
+  shopt -u nullglob
+  if (( ${#metas[@]} == 0 )); then
+    echo '[]'
+    exit 0
+  fi
+  jq -s '
+    map({
+      id: (.id // ""),
+      name: (.name // "Unnamed"),
+      type: (.type // ""),
+      host: (.host // ""),
+      port: (.port // 0),
+      added: (.added // 0),
+      link: (.link // ""),
+      security: (.security // ""),
+      network: (.network // "")
+    })
+    | sort_by(.name | ascii_downcase)
+  ' "${metas[@]}"
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: import
+# -----------------------------------------------------------------------------
+# The panel parses the share link in JavaScript (where string handling is
+# pleasant), then pipes us:
+#
+#   { "id": "<slug>", "meta": {...}, "config": {...} }
+#
+# We only validate and persist. Re-importing the same link produces the same id,
+# so it updates the existing profile instead of creating a duplicate.
+#
+# We accept the payload on stdin rather than argv because an xray config can be
+# large, and argv is limited by ARG_MAX.
+cmd_import() {
+  ensure_dirs
+
+  # The payload can arrive three ways, in priority order:
+  #   1. as an argument            — what the QML panel uses (no stdin hazards)
+  #   2. in $OMARCHY_V2RAY_PAYLOAD — handy for systemd units and other callers
+  #   3. on stdin                  — what humans and scripts use
+  # A config is well under ARG_MAX, so an argument is the simplest safe path.
+  local payload="${1:-}"
+  if [[ -z $payload ]]; then
+    if [[ -n ${OMARCHY_V2RAY_PAYLOAD:-} ]]; then
+      payload="$OMARCHY_V2RAY_PAYLOAD"
+    elif [[ -t 0 ]]; then
+      emit_error "no payload: pass JSON as an argument, set OMARCHY_V2RAY_PAYLOAD, or pipe it on stdin"
+    else
+      payload="$(cat)"
+    fi
+  fi
+  [[ -n $payload ]] || emit_error "empty import payload"
+
+  # Validate the shape before touching the filesystem.
+  echo "$payload" | jq -e '
+      (.id | type == "string" and length > 0)
+      and (.meta | type == "object")
+      and (.config | type == "object")
+      and ((.config.inbounds | type) == "array")
+      and ((.config.outbounds | type) == "array")
+    ' >/dev/null 2>&1 || emit_error "invalid import payload"
+
+  local id
+  id="$(echo "$payload" | jq -r '.id')"
+  # Defence in depth: never let a crafted id escape PROFILES_DIR.
+  [[ $id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || emit_error "invalid profile id"
+  [[ $id != *".."* ]] || emit_error "invalid profile id"
+
+  local was_active=""
+  [[ -f $ACTIVE_FILE ]] && was_active="$(tr -d '\n' <"$ACTIVE_FILE")"
+
+  # Write atomically: a half-written config that the engine reads would be an
+  # ugly class of bug, so each file goes to a temp name and is moved into place.
+  local tmp_meta tmp_config
+  tmp_meta="$PROFILES_DIR/.$id.meta.tmp"
+  tmp_config="$PROFILES_DIR/.$id.config.tmp"
+
+  echo "$payload" | jq -c --arg id "$id" '.meta + {id: $id}' >"$tmp_meta" || emit_error "could not write metadata"
+  echo "$payload" | jq -c '.config' >"$tmp_config" || emit_error "could not write config"
+
+  chmod 600 "$tmp_meta" "$tmp_config"
+  mv -f "$tmp_meta" "$(meta_path "$id")"
+  mv -f "$tmp_config" "$(config_path "$id")"
+
+  # If we just replaced the profile that is currently connected, restart it so
+  # the running tunnel matches what the user sees. This is the common case when
+  # someone re-imports an updated link for the same server.
+  local restarted=false
+  if [[ -n $was_active && $was_active == "$id" ]]; then
+    if [[ -n "$(read_pid)" ]]; then
+      start_profile "$id" >/dev/null 2>&1 && restarted=true
+    fi
+  fi
+
+  # Tell the panel up front when this link cannot run on the installed core, so
+  # the user learns it at import time instead of at the first failed connect.
+  # Same rule as require_capable_engine, reported as data rather than an error:
+  # the import itself did succeed and the profile is worth keeping.
+  local missing
+  missing="$(xray_only_features "$id")"
+  [[ "$(engine_bin)" == "xray" ]] && missing=""
+
+  if [[ -n $missing ]]; then
+    jq -n --arg id "$id" --argjson restarted "$restarted" --arg missing "$missing" \
+      '{ok: true, id: $id, restarted: $restarted, needsXray: true, needsXrayReason: $missing}'
+  else
+    jq -n --arg id "$id" --argjson restarted "$restarted" \
+      '{ok: true, id: $id, restarted: $restarted}'
+  fi
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: remove
+# -----------------------------------------------------------------------------
+cmd_remove() {
+  ensure_dirs
+  local id="${1:-}"
+  [[ -n $id ]] || emit_error "remove needs a profile id"
+  profile_exists "$id" || emit_error "unknown profile: $id"
+
+  # Disconnect first, otherwise the engine keeps running against a config file
+  # that no longer exists (which is fine, but confusing to debug later).
+  local active=""
+  [[ -f $ACTIVE_FILE ]] && active="$(tr -d '\n' <"$ACTIVE_FILE")"
+  [[ $active == "$id" ]] && stop_engine
+
+  rm -f "$(meta_path "$id")" "$(config_path "$id")"
+  # Forget the autostart pointer if it named this profile.
+  local auto=""
+  [[ -f $AUTOSTART_FILE ]] && auto="$(tr -d '\n' <"$AUTOSTART_FILE")"
+  [[ $auto == "$id" ]] && rm -f "$AUTOSTART_FILE"
+
+  jq -n --arg id "$id" '{ok: true, id: $id}'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Internal: start_profile ID
+# -----------------------------------------------------------------------------
+# Brings the engine up in the background and waits until the SOCKS port really
+# accepts connections, so the UI never says "connected" for a tunnel that died
+# on a bad config.
+#
+# THE DAEMONIZE TRICK: the caller is often a short-lived Quickshell `Process`
+# item, and QProcess kills its children when it is destroyed. `setsid` plus a
+# full detach (stdin </dev/null, stdout/stderr to the log) reparents the engine
+# to init, so the tunnel outlives the script that launched it.
+start_profile() {
+  local id="$1"
+  local config
+  config="$(config_path "$id")"
+  [[ -f $config ]] || { jq -n --arg e "unknown profile: $id" '{ok:false,error:$e}'; return 1; }
+
+  local engine
+  engine="$(engine_bin)"
+  [[ -n $engine ]] || { jq -n '{ok:false,error:"no v2ray/xray engine installed",needsEngine:true}'; return 1; }
+
+  # REALITY/XHTTP profiles cannot run on v2ray-core; say so now rather than
+  # letting the engine start, hang, and get reported as a bad server.
+  require_capable_engine "$id" "$engine" || return 1
+
+  # Starting a second engine would fail on a taken port, so stop the old one.
+  stop_engine >/dev/null 2>&1
+
+  : >"$LOG_FILE"
+
+  # `exec` inside the subshell keeps the PID we record identical to the engine's
+  # PID, which matters for stop: we never want to signal a wrapper that has
+  # already exited while the real engine keeps running.
+  (
+    exec setsid "$engine" run -c "$config" >>"$LOG_FILE" 2>&1 </dev/null
+  ) &
+  local pid=$!
+
+  echo "$pid" >"$PID_FILE"
+  echo "$id" >"$ACTIVE_FILE"
+  date +%s >"$STARTED_FILE"
+
+  local socks
+  socks="$(jq -r '.inbounds[0].port' "$config" 2>/dev/null)"
+  [[ -n $socks ]] || socks="$DEFAULT_SOCKS_PORT"
+
+  # Poll for up to ~6 seconds. The engine usually binds in well under a second;
+  # the generous window covers a cold disk and a slow first DNS lookup.
+  local attempt
+  for attempt in $(seq 1 40); do
+    if ! process_alive "$pid"; then
+      break
+    fi
+    if port_listening "$socks"; then
+      jq -n --arg id "$id" --argjson pid "$pid" --argjson port "$socks" \
+        '{ok: true, id: $id, pid: $pid, socksPort: $port}'
+      return 0
+    fi
+    sleep 0.15
+  done
+
+  # Failure: clean up the state files so `status` does not report a ghost.
+  local tail_text
+  tail_text="$(last_log_lines 6)"
+  rm -f "$PID_FILE" "$ACTIVE_FILE" "$STARTED_FILE"
+  process_alive "$pid" && kill -TERM "$pid" 2>/dev/null
+  jq -n --arg e "${tail_text:-engine exited immediately}" \
+    '{ok:false,error:$e,failedToStart:true}'
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# Internal: stop_engine
+# -----------------------------------------------------------------------------
+stop_engine() {
+  local pid
+  pid="$(read_pid)"
+  if [[ -n $pid ]]; then
+    kill -TERM "$pid" 2>/dev/null
+    local attempt
+    for attempt in $(seq 1 25); do
+      process_alive "$pid" || break
+      sleep 0.2
+    done
+    # Escalate only if the engine ignored SIGTERM; xray normally exits at once.
+    process_alive "$pid" && kill -KILL "$pid" 2>/dev/null
+  fi
+  rm -f "$PID_FILE" "$ACTIVE_FILE" "$STARTED_FILE"
+}
+
+# -----------------------------------------------------------------------------
+# Subcommands: start / stop / restart / toggle
+# -----------------------------------------------------------------------------
+cmd_start() {
+  ensure_dirs
+  local id="${1:-}"
+  [[ -n $id ]] || emit_error "start needs a profile id"
+  profile_exists "$id" || emit_error "unknown profile: $id"
+  start_profile "$id"
+  exit $?
+}
+
+cmd_stop() {
+  ensure_dirs
+  stop_engine
+  emit_ok '{"ok":true,"running":false}'
+}
+
+cmd_restart() {
+  ensure_dirs
+  local id="${1:-}"
+  [[ -n $id ]] || emit_error "restart needs a profile id"
+  profile_exists "$id" || emit_error "unknown profile: $id"
+  start_profile "$id"
+  exit $?
+}
+
+# `toggle` is what the bar icon's right-click and the panel's big switch call.
+# With no argument it reconnects the last profile, or the autostart one — that
+# is what makes a single click on the bar feel like a VPN switch.
+cmd_toggle() {
+  ensure_dirs
+  if [[ -n "$(read_pid)" ]]; then
+    stop_engine
+    emit_ok '{"ok":true,"running":false}'
+  fi
+
+  local id="${1:-}"
+  if [[ -z $id && -f $ACTIVE_FILE ]]; then
+    id="$(tr -d '\n' <"$ACTIVE_FILE")"
+  fi
+  if [[ -z $id && -f $AUTOSTART_FILE ]]; then
+    id="$(tr -d '\n' <"$AUTOSTART_FILE")"
+  fi
+  # Last resort: if exactly one profile exists, use it (a single-server setup
+  # should not require picking anything).
+  if [[ -z $id ]]; then
+    shopt -s nullglob
+    local metas=("$PROFILES_DIR"/*.meta.json)
+    shopt -u nullglob
+    [[ ${#metas[@]} -eq 1 ]] && id="$(jq -r '.id' "${metas[0]}")"
+  fi
+  [[ -n $id ]] || emit_error "no profile to connect; import one first"
+
+  start_profile "$id"
+  exit $?
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: ping
+# -----------------------------------------------------------------------------
+# Measures the latency the user will actually feel: a real handshake through a
+# throwaway engine, not a TCP connect to the server's port (which would report
+# a happy 40 ms for a server whose UUID has been revoked).
+#
+# The profile's real config is reused with jq-patched ports, so we test exactly
+# the same settings, just on a spare port that does not disturb the live tunnel.
+cmd_ping() {
+  ensure_dirs
+  local id="${1:-}"
+  [[ -n $id ]] || emit_error "ping needs a profile id"
+  profile_exists "$id" || emit_error "unknown profile: $id"
+
+  local engine
+  engine="$(engine_bin)"
+  [[ -n $engine ]] || { jq -n '{ok:false,error:"no v2ray/xray engine installed",needsEngine:true}'; exit 0; }
+
+  # Same capability gate as start_profile: a REALITY profile probes as "no
+  # response" on v2ray-core, which would blame the server for our own gap.
+  require_capable_engine "$id" "$engine" || exit 0
+
+  # A private temp DIRECTORY, not two bare mktemp files.
+  #
+  # BUG FIX (this one produced a completely misleading error message): xray's
+  # `-format auto` picks the config format from the file extension. `mktemp`
+  # hands back /tmp/tmp.a1b2c3d4 — no extension — and xray responds
+  #     Failed to start: ... core: Failed to get format of /tmp/tmp.a1b2c3d4
+  # and exits before binding anything. The probe engine never came up, yet the
+  # user was told "bad UUID, wrong server, or blocked port". Naming the file
+  # config.json fixes the root cause.
+  local socks_port http_port tmp_dir tmp_config tmp_log pid
+  socks_port="$(free_port)"
+  http_port=$((socks_port + 1))
+  tmp_dir="$(mktemp -d)"
+  tmp_config="$tmp_dir/config.json"
+  tmp_log="$tmp_dir/engine.log"
+
+  # Patch both inbound ports to the spare pair.
+  jq -c --argjson socks "$socks_port" --argjson http "$http_port" \
+    '.inbounds[0].port = $socks | .inbounds[1].port = $http' \
+    "$(config_path "$id")" >"$tmp_config" || { rm -f "$tmp_config" "$tmp_log"; rmdir "$tmp_dir" 2>/dev/null; emit_error "could not prepare probe config"; }
+
+  setsid "$engine" run -c "$tmp_config" >>"$tmp_log" 2>&1 </dev/null &
+  pid=$!
+
+  # Wait for the probe engine to bind its SOCKS port before asking it anything.
+  local attempt
+  for attempt in $(seq 1 30); do
+    port_listening "$socks_port" && break
+    process_alive "$pid" || break
+    sleep 0.1
+  done
+
+  # Ask curl for BOTH the HTTP status and the elapsed time. Checking the status
+  # (and curl's own exit code) is what stops a hung or refusing proxy from being
+  # reported as a fast server: curl prints "000 0.001" when it never spoke to
+  # anyone, and that must not become a triumphant "0 ms".
+  # curl_status starts at -1, NOT 1, and http_code starts EMPTY, NOT "000".
+  #
+  # WHY THIS MATTERS: with the old initial values, "the probe engine never came
+  # up" was indistinguishable from "the tunnel was up but no reply came back",
+  # because an unset http_code of "000" matched the same branch. The message
+  # then accused the server of being wrong. -1 and "" can only mean "curl never
+  # ran", so each failure gets its own honest sentence.
+  local result="" curl_status=-1 http_code="" time_total="" ms=0
+  if port_listening "$socks_port"; then
+    result="$(curl --max-time "$PING_TIMEOUT" -s -o /dev/null -w '%{http_code} %{time_total}' \
+      --proxy "socks5h://127.0.0.1:$socks_port" "$PING_URL" 2>/dev/null)"
+    curl_status=$?
+    http_code="${result%% *}"
+    time_total="${result##* }"
+  fi
+
+  kill -TERM "$pid" 2>/dev/null
+  # Give the child a moment to die so we do not leak a listener on the spare port.
+  for attempt in $(seq 1 20); do
+    process_alive "$pid" || break
+    sleep 0.05
+  done
+  process_alive "$pid" && kill -KILL "$pid" 2>/dev/null
+
+  # Read the probe's own log BEFORE removing it. This is the engine's account of
+  # what went wrong, and it is useless once the file is gone.
+  #
+  # TWO readings of the same tail, on purpose:
+  #   probe_detail      — repeats collapsed, for the popup's one red line
+  #   probe_detail_raw  — untouched, for `detailFull` / "copy details" / bug reports
+  # Collapsing is lossy, so the un-collapsed text has to be captured separately;
+  # deriving one from the other would quietly throw the repeats away.
+  local probe_detail probe_detail_raw
+  probe_detail="$(last_log_lines 4 "$tmp_log")"
+  probe_detail_raw="$(tail -n 4 "$tmp_log" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g;s/ *$//')"
+  local probe_ran=false
+  [[ -s $tmp_log ]] && probe_ran=true
+
+  # Read the engine's verdict while the log still exists. "received real
+  # certificate" means the server answered with the genuine certificate of the
+  # domain we are pretending to be — i.e. it refused the REALITY handshake and fell
+  # back to proxying. That is a MUCH more specific story than "the tunnel did not
+  # answer", and it is the one case users hit most often, so it gets its own
+  # sentence and points at the command that explains it further.
+  local declined=false
+  grep -q 'received real certificate' "$tmp_log" 2>/dev/null && declined=true
+  rm -f "$tmp_config" "$tmp_log"
+  rmdir "$tmp_dir" 2>/dev/null
+
+  # A real measurement needs: curl succeeded (0), an HTTP 2xx/3xx came back, and
+  # a positive duration. Anything else means the tunnel did not actually carry
+  # traffic, which is exactly what the user needs to be told.
+  if [[ $curl_status -eq 0 && $http_code =~ ^[23] && -n $time_total ]]; then
+    ms="$(awk -v t="$time_total" 'BEGIN { printf "%d", t * 1000 }')"
+    if (( ms > 0 )); then
+      jq -n --argjson ms "$ms" --argjson port "$socks_port" \
+        '{ok:true, ms:$ms, probePort:$port}'
+      exit 0
+    fi
+  fi
+
+  # Explain the failure in terms the user can act on, in the order the layers
+  # actually fail: engine -> proxy port -> tunnel -> reply.
+  local reason
+  if (( curl_status == -1 )); then
+    # Keep this one short: the engine's own words go in `detail`, which the
+    # popup already appends, and pasting them here too would double them up.
+    reason="the probe engine never started"
+  elif (( curl_status == 28 )); then
+    reason="timed out after ${PING_TIMEOUT}s"
+  elif (( curl_status == 7 )); then
+    reason="the engine never opened a local proxy port"
+  elif [[ $declined == true ]]; then
+    reason="the server refused the REALITY handshake — it replied with the real certificate of the domain instead of accepting us, so the injected uuid/public key/short id was rejected (or our clock is too far off for the server's maxTimeDiff). Run 'bin/omarchy-v2ray debug <id>' for the handshake details"
+  else
+    reason="the tunnel did not answer (bad UUID, wrong public key, unreachable server, or blocked port)"
+  fi
+  # The popup paints "<error> (<detail>)" on ONE red line. xray's debug lines are
+  # hundreds of characters long, so the raw tail turned the popup into a wall of
+  # unreadable text. `detail` is therefore clamped to two folded lines; the
+  # untouched log is still returned as `detailFull`, which the popup offers behind
+  # a "Copy details" button and which is what you paste into a bug report.
+  local detail_short
+  detail_short="$(printf '%s' "$probe_detail" \
+    | fold -s -w 160 \
+    | head -2 \
+    | tr '\n' ' ' \
+    | sed 's/  */ /g;s/ *$//')"
+  jq -n --arg e "$reason" --arg d "$detail_short" --arg df "$probe_detail_raw" \
+        --argjson ran "$probe_ran" \
+    '{ok:false, error:$e, detail:$d, detailFull:$df, engineLogged:$ran}'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: debug
+# -----------------------------------------------------------------------------
+# The "why is my server not working" command. Everything the plugin does is
+# invisible — two short-lived engine runs and a curl between them — so when a
+# tunnel fails there is nothing on screen to inspect. This runs the SAME engine
+# with the SAME config, but:
+#
+#   * on spare ports, so it never disturbs a live tunnel,
+#   * with loglevel forced to "debug", so the handshake is actually narrated,
+#   * in the foreground long enough for a real request to go through, and
+#   * prints a report that includes the engine's full log.
+#
+# It is deliberately verbose. The point is to be pasteable into a bug report.
+cmd_debug() {
+  ensure_dirs
+  local id="${1:-}"
+  [[ -n $id ]] || emit_error "debug needs a profile id"
+  profile_exists "$id" || emit_error "unknown profile: $id"
+
+  local engine
+  engine="$(engine_bin)"
+  [[ -n $engine ]] || { jq -n '{ok:false,error:"no v2ray/xray engine installed",needsEngine:true}'; exit 0; }
+
+  require_capable_engine "$id" "$engine" || exit 0
+
+  # Same .json-extension requirement as cmd_ping — see the long note there.
+  local socks_port http_port tmp_dir tmp_config tmp_log pid
+
+  # REGRESSION GUARD — two separate traps live in these five lines.
+  #
+  # 1. ORDER. address/server_ip/server_port/sni are declared here but assigned
+  #    much further down, because their values come out of the profile config.
+  #    They must be declared before the handshake-note block below, which mentions
+  #    $sni. Declared later, the first use aborts the whole command with
+  #    "sni: unbound variable", and it only fires when the engine actually logged
+  #    "received real certificate" — i.e. exactly when the report matters most.
+  #
+  # 2. THE `=""`. This script runs under `set -u`, and a bare `local name` does
+  #    NOT mark the variable as set in Bash:
+  #
+  #        set -u; f() { local b; echo "$b"; }; f      # => b: unbound variable
+  #
+  #    Declaring without a value is therefore not enough — it has to be assigned.
+  #    That one missing `=""` is what crashed this command for real.
+  local address="" server_ip="" server_port="" sni=""
+  socks_port="$(free_port)"
+  http_port=$((socks_port + 1))
+  tmp_dir="$(mktemp -d)"
+  tmp_config="$tmp_dir/config.json"
+  tmp_log="$tmp_dir/engine.log"
+
+  # Force debug logging. `log.loglevel` is the only knob that decides whether
+  # the REALITY/TLS handshake failure is narrated or swallowed.
+  jq -c --argjson socks "$socks_port" --argjson http "$http_port" \
+    '.log.loglevel = "debug" | .inbounds[0].port = $socks | .inbounds[1].port = $http' \
+    "$(config_path "$id")" >"$tmp_config" 2>/dev/null \
+    || { rm -f "$tmp_config" "$tmp_log"; rmdir "$tmp_dir" 2>/dev/null; emit_error "could not prepare debug config"; }
+
+  setsid "$engine" run -c "$tmp_config" >>"$tmp_log" 2>&1 </dev/null &
+  pid=$!
+
+  # Wait for the proxy to accept connections, but also notice an early death:
+  # a config or bind error kills the engine in milliseconds and the log says why.
+  local attempt engine_alive=false engine_died=false listening=false
+  for attempt in $(seq 1 60); do
+    if port_listening "$socks_port"; then listening=true; break; fi
+    if ! process_alive "$pid"; then engine_died=true; break; fi
+    sleep 0.1
+  done
+  process_alive "$pid" && engine_alive=true
+
+  # -1 / "" can only mean "curl never ran" — the same sentinel rule cmd_ping uses,
+  # so "the engine never came up" can never be reported as "the server did not
+  # answer". With the old 1 / "000" pair those two were indistinguishable.
+  local curl_status=-1 http_code="" time_total="" probe_detail=""
+  if [[ $listening == true ]]; then
+    # -w prints "<http status> <seconds>" on one line, and a failed tunnel
+    # prints "000 0.000000" rather than nothing, so we can always tell "the
+    # request failed" apart from "curl never ran".
+    local result
+    result="$(curl --max-time "${DEBUG_TIMEOUT:-12}" -s -o /dev/null \
+      -w '%{http_code} %{time_total}' \
+      --proxy "socks5h://127.0.0.1:$socks_port" "$PING_URL" 2>/dev/null)"
+    curl_status=$?
+    http_code="${result%% *}"
+    time_total="${result##* }"
+  fi
+
+  # Unconditional snapshot: every branch below wants it.
+  #
+  # NOTE: unlike the one-line flattening used inside JSON error fields, the debug
+  # report keeps the log's real newlines. Someone has to read this, and a
+  # 60-line log squashed onto one line is not readable.
+  probe_detail_flattened="$(last_log_lines 60 "$tmp_log")"
+  probe_detail="$(tail -n 60 "$tmp_log" 2>/dev/null)"
+
+  kill -TERM "$pid" 2>/dev/null
+  for attempt in $(seq 1 20); do
+    process_alive "$pid" || break
+    sleep 0.05
+  done
+  process_alive "$pid" && kill -KILL "$pid" 2>/dev/null
+  rm -f "$tmp_config" "$tmp_log"
+  rmdir "$tmp_dir" 2>/dev/null
+
+  # One-line verdict, in the order the layers fail.
+  local verdict
+  if [[ $engine_died == true ]]; then
+    verdict="the engine refused to start (see the log: a bad config or a taken port)"
+  elif [[ $listening == false ]]; then
+    verdict="the engine never opened its local proxy port"
+  elif [[ $http_code =~ ^[23] ]]; then
+    verdict="THE TUNNEL WORKS — request returned HTTP $http_code in ${time_total}s"
+  else
+    verdict="the engine ran, but no reply came back through the tunnel (HTTP $http_code, curl exit $curl_status)"
+  fi
+
+  # (declared at the top of this function — see the regression note there)
+  server_ip="$(jq -r '.outbounds[] | select(.tag=="proxy") | .settings.vnext[0].address' "$(config_path "$id")" 2>/dev/null)"
+  server_port="$(jq -r '.outbounds[] | select(.tag=="proxy") | .settings.vnext[0].port' "$(config_path "$id")" 2>/dev/null)"
+  sni="$(jq -r '.outbounds[] | select(.tag=="proxy") | .streamSettings.realitySettings.serverName // .streamSettings.tlsSettings.serverName // ""' "$(config_path "$id")" 2>/dev/null)"
+  address="$server_ip:$server_port"
+
+  # ---- two extra probes, both aimed at the "received real certificate" family
+  # of failures, because that is the one message that cannot be read on its own.
+
+  # 1. Clock drift, measured against a host we can reach without the tunnel.
+  local skew skew_text
+  skew="$(clock_skew_seconds "$PING_HOST_FOR_CLOCK")"
+  if [[ -n $skew ]]; then skew_text="${skew}s"; else skew_text="unknown"; fi
+
+  # 2. Certificate identity. `server_cert` is what the server IP presents for our
+  #    SNI; `direct_cert` is what the genuine domain presents. A REALITY server
+  #    that declines our auth falls back to proxying to the real domain, so for a
+  #    healthy-but-unauthenticated setup BOTH should be the real domain's
+  #    certificate. If the two disagree, the IP is being redirected somewhere
+  #    else entirely — a network problem, not a config problem.
+  local server_cert direct_cert
+  server_cert="$(probe_cert "$server_ip" "$server_port" "$sni")"
+  direct_cert="$(probe_cert "$sni" 443 "$sni")"
+
+  local have_openssl=false
+  command -v openssl >/dev/null 2>&1 && have_openssl=true
+
+  # Compare the signing ORGANISATION, not the whole subject+issuer string. See
+  # ca_of(): different Google datacenters legitimately sign with different issuer
+  # CNs (WE2 vs WR2) for the very same domain, and treating that as an attack
+  # produced a false "MISMATCH" on a connection that was in fact working.
+  local server_ca direct_ca
+  server_ca="$(ca_of "$server_cert")"
+  direct_ca="$(ca_of "$direct_cert")"
+
+  local network_note
+  if [[ $have_openssl == false ]]; then
+    network_note="not checked (openssl is not installed)"
+  else
+    network_note="no TLS handshake could be completed from this machine"
+  fi
+
+  if [[ -n $server_cert || -n $direct_cert ]]; then
+    if [[ -z $server_cert ]]; then
+      network_note="could not complete a TLS handshake with $address at all"
+    elif [[ -z $direct_cert ]]; then
+      network_note="server presents: $server_cert (could not reach $sni directly to compare)"
+    elif [[ -n $server_ca && $server_ca == "$direct_ca" ]]; then
+      # Same signer => this really is the domain behind the IP. Report the two
+      # raw strings anyway, so the "but they look different!" follow-up answers
+      # itself: the issuer CN differs while the organisation matches.
+      network_note="the $address IP presents a certificate signed by the same authority as the real $sni ($server_ca). The path is clean — a differing issuer CN (WE2 vs WR2) is just a different Google front, and is NOT interception."
+    else
+      network_note="MISMATCH — $address presents a certificate signed by '$server_ca' while the real $sni uses '$direct_ca'. Something in the network path may be intercepting or redirecting it."
+    fi
+  fi
+
+  # Screen-read the engine's own narration and turn it into one sentence. The
+  # certificate comparison above cannot tell "we authenticated and then the reply
+  # was slow" apart from "we never authenticated at all" — the engine log can:
+  #
+  #   * "XtlsFilterTls found tls client hello" / "tunneling request to" appears
+  #     ONLY after REALITY accepted our credentials and handed the request to the
+  #     server. A failure AFTER those lines is a LATE failure (no reply in time),
+  #     not a credential problem.
+  #   * "received real certificate" is the opposite: the server answered with its
+  #     fallback certificate, i.e. it rejected us.
+  #
+  # It runs HERE, not earlier, for two reasons: it needs $sni for its wording, and
+  # it greps the log we already copied into $probe_detail instead of re-reading a
+  # file that has been deleted by now.
+  # ---- how long did the OUTER REALITY handshake take? ------------------------
+  # Why this matters: on a slow uplink the engine can spend most of the deadline
+  # just completing the REALITY handshake. The request then times out and the
+  # report used to look identical to "bad link" / "broken server", even though
+  # the credentials were accepted. Measuring the two moments removes the doubt:
+  #
+  #   * t0 = the line where the engine ACCEPTED our SOCKS request
+  #          (`... accepted tcp:... [socks-in >> proxy]`).
+  #   * t1 = the line where the engine HANDED the request to the server
+  #          (`tunneling request to ...` or `XtlsFilterTls found tls client hello`).
+  #   * t1 - t0 = seconds the outer handshake consumed.
+  #
+  # Xray timestamps are `YYYY/MM/DD HH:MM:SS.ffffff` and all lines belong to the
+  # same run, so plain seconds-of-day arithmetic is enough — no date library and
+  # no dependency on `date -d` (which BSD/macOS would spell differently).
+  local handshake_seconds
+  handshake_seconds="$(awk '
+    $2 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+$/ {
+      split($2, t, ":")                       # t[1]=HH t[2]=MM t[3]=SS.ffffff
+      sec = t[1] * 3600 + t[2] * 60 + t[3]    # seconds of day, fractional part kept
+      if (t0 == "" && /\[socks-in >> proxy\]/) t0 = sec
+      if (t1 == "" && (/XtlsFilterTls found tls client hello/ || /tunneling request to/)) t1 = sec
+    }
+    END { if (t0 != "" && t1 != "" && t1 >= t0) printf "%.2f", t1 - t0 }
+  ' <<<"$probe_detail")"
+
+  # Sentence appended to the handshake note only when we actually measured it.
+  local handshake_timing=""
+  if [[ -n $handshake_seconds ]]; then
+    handshake_timing=" The outer REALITY handshake alone took ${handshake_seconds}s of the ${DEBUG_TIMEOUT:-12}s deadline."
+  fi
+
+  local handshake_note
+  if grep -qE 'XtlsFilterTls found tls client hello|tunneling request to' <<<"$probe_detail"; then
+    handshake_note="REALITY authentication SUCCEEDED (the engine forwarded a TLS ClientHello into the tunnel), so the server accepted the uuid / public key / short id. The failure is later: no reply came back within the ${DEBUG_TIMEOUT:-12}s deadline. That points at a slow or blocked uplink, or a broken server — NOT at a bad link.${handshake_timing}"
+  elif grep -q 'received real certificate' <<<"$probe_detail"; then
+    handshake_note="the $address server answered with the REAL certificate of $sni instead of completing a REALITY handshake, which means it rejected our credentials (uuid, public key or short id) — or our clock is too far from the server's for its maxTimeDiff — or something on the path is redirecting us.${handshake_timing}"
+  else
+    handshake_note="no handshake evidence in the engine log (the engine never got far enough to try one)."
+  fi
+
+  local report
+  report="$(printf '%s\n' \
+    "v2ray-client debug report" \
+    "  profile        : $id" \
+    "  engine         : $engine ($("$engine" version 2>/dev/null | head -1))" \
+    "  server         : ${address:-unknown}" \
+    "  probe ports    : socks=$socks_port http=$http_port" \
+    "  engine started : $engine_alive (died early: $engine_died)" \
+    "  socks open     : $listening" \
+    "  request result : HTTP ${http_code:-n/a} after ${time_total:-n/a}s (curl exit $curl_status)" \
+    "  target         : $PING_URL" \
+    "  clock skew     : $skew_text (local clock minus a directly-reached TLS server)" \
+    "  server cert    : ${server_cert:-unavailable}" \
+    "  real $sni cert : ${direct_cert:-unavailable}" \
+    "  network note   : $network_note" \
+    "  handshake time : ${handshake_seconds:-n/a}s (request accepted -> forwarded into the tunnel)" \
+    "  handshake      : $handshake_note" \
+    "  verdict        : $verdict" \
+    "" \
+    "--- engine log (debug level) ---" \
+    "$probe_detail")"
+
+  # A clock that is minutes off is its own, easily-missed failure. Say so loudly.
+  if [[ -n $skew ]] && { (( skew > 5 )) || (( skew < -5 )); }; then
+    report="$report
+
+!! Your clock is off by ${skew}s. REALITY embeds a timestamp in every handshake,
+   and a server with maxTimeDiff set will reject a client whose clock has drifted —
+   with the same 'received real certificate' error. Fix with:
+       sudo systemctl restart systemd-timesyncd && sudo systemctl restart systemd-time-wait-sync"
+  fi
+
+  jq -n --arg report "$report" --arg engine "$engine" \
+    --argjson socksPort "$socks_port" --argjson listening "$listening" \
+    --argjson engineAlive "$engine_alive" --argjson engineDied "$engine_died" \
+    --argjson curlStatus "$curl_status" --arg httpCode "$http_code" \
+    --arg timeTotal "$time_total" --arg address "$address" \
+    --arg verdict "$verdict" --arg log "$probe_detail_flattened" \
+    --arg clockSkew "$skew" --arg serverCert "$server_cert" \
+    --arg directCert "$direct_cert" --arg networkNote "$network_note" \
+    --arg handshakeNote "$handshake_note" \
+    --arg handshakeSeconds "$handshake_seconds" \
+    '{ok:true, report:$report, engine:$engine, socksPort:$socksPort,
+      listening:$listening, engineAlive:$engineAlive, engineDied:$engineDied,
+      curlStatus:$curlStatus, httpCode:$httpCode, timeTotal:$timeTotal,
+      serverAddress:$address, verdict:$verdict, engineLog:$log,
+      clockSkewSeconds:$clockSkew, serverCertificate:$serverCert,
+      realDomainCertificate:$directCert, networkNote:$networkNote,
+      handshakeNote:$handshakeNote, handshakeSeconds:$handshakeSeconds}'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: link
+# -----------------------------------------------------------------------------
+# Print just the original share link (used by the panel's "copy link" action).
+# Trailing newline is intentional; the caller trims.
+cmd_link() {
+  ensure_dirs
+  local id="${1:-}"
+  [[ -n $id ]] || emit_error "link needs a profile id"
+  profile_exists "$id" || emit_error "unknown profile: $id"
+  jq -r '.link // ""' "$(meta_path "$id")"
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: log
+# -----------------------------------------------------------------------------
+# Plain text, not JSON: this one is for humans debugging in a terminal.
+cmd_log() {
+  ensure_dirs
+  [[ -f $LOG_FILE ]] || { echo "no engine log yet"; exit 0; }
+  tail -n "${1:-30}" "$LOG_FILE"
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: autostart
+# -----------------------------------------------------------------------------
+# Stored as a file rather than a systemd unit: the shell reads it on start, so
+# it needs no privileged install step and can be turned off by deleting a file.
+cmd_autostart() {
+  ensure_dirs
+  local id="${1:-}"
+  if [[ -z $id ]]; then
+    [[ -f $AUTOSTART_FILE ]] && { tr -d '\n' <"$AUTOSTART_FILE"; echo; } || echo "off"
+    exit 0
+  fi
+  if [[ $id == "off" ]]; then
+    rm -f "$AUTOSTART_FILE"
+    emit_ok '{"ok":true,"autostartId":""}'
+  fi
+  profile_exists "$id" || emit_error "unknown profile: $id"
+  echo "$id" >"$AUTOSTART_FILE"
+  jq -n --arg id "$id" '{ok:true, autostartId:$id}'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: install-engine
+# -----------------------------------------------------------------------------
+# Hands the install to a visible terminal, because pacman needs a password and
+# we are not allowed to prompt from inside the shell process.
+cmd_install_engine() {
+  if [[ -n "$(engine_bin)" ]]; then
+    emit_ok '{"ok":true,"alreadyInstalled":true}'
+  fi
+  # We install `v2ray`, NOT `xray`.
+  #
+  # There is no `xray` package in Arch's official repositories. Searching for
+  # "xray" there turns up `python-aws-xray-sdk`, which is Amazon's X-Ray tracing
+  # SDK for Python and completely unrelated to this plugin. The proxy core named
+  # xray only exists in the AUR, so a `omarchy pkg add xray` line would simply
+  # fail for most users.
+  #
+  # `extra/v2ray` is the official package and covers the link types we import.
+  # Users who need REALITY/XHTTP can additionally install the AUR xray with
+  #   omarchy pkg aur add xray        (or: yay -S xray)
+  # and this script will then prefer it automatically (see engine_bin above).
+  local install_cmd="omarchy pkg add v2ray"
+  local launcher="omarchy-launch-floating-terminal-with-presentation"
+  if command -v "$launcher" >/dev/null 2>&1; then
+    # `which` guard above means this is the omarchy wrapper; fall back to a
+    # plain terminal for other desktops.
+    setsid "$launcher" "$install_cmd" >/dev/null 2>&1 &
+  else
+    setsid xdg-terminal-exec "$install_cmd" >/dev/null 2>&1 &
+  fi
+  emit_ok '{"ok":true,"launched":true}'
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: install-xray
+# -----------------------------------------------------------------------------
+# The optional upgrade path. xray lives in the AUR, not in the official repos,
+# so this one needs an AUR helper. `omarchy pkg aur add` is Omarchy's wrapper
+# around whichever helper the user has; we fall back to a bare `yay -S xray`
+# when that subcommand is missing (older Omarchy).
+cmd_install_xray() {
+  if [[ "$(engine_bin)" == "xray" ]]; then
+    emit_ok '{"ok":true,"alreadyInstalled":true}'
+  fi
+
+  # Pick the command that actually exists on this machine.
+  #
+  # `omarchy pkg aur add` is Omarchy's wrapper around whichever AUR helper the
+  # user has, and it is the friendlier of the two (it skips the install when the
+  # package is already there). It only exists on newer Omarchy builds, and
+  # `omarchy pkg aur --help` is NOT a valid probe — that prints "Unknown Omarchy
+  # command" — so we look for the subcommand in the real help text instead.
+  local install_cmd="yay -S xray"
+  if omarchy pkg --help 2>/dev/null | grep -q 'pkg aur add'; then
+    install_cmd="omarchy pkg aur add xray"
+  fi
+
+  local launcher="omarchy-launch-floating-terminal-with-presentation"
+  if command -v "$launcher" >/dev/null 2>&1; then
+    setsid "$launcher" "$install_cmd" >/dev/null 2>&1 &
+  else
+    setsid xdg-terminal-exec "$install_cmd" >/dev/null 2>&1 &
+  fi
+  jq -n --arg cmd "$install_cmd" '{ok:true, launched:true, command:$cmd}'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: reveal
+# -----------------------------------------------------------------------------
+cmd_reveal() {
+  ensure_dirs
+  setsid xdg-open "$CONFIG_DIR" >/dev/null 2>&1 &
+  emit_ok '{"ok":true}'
+}
+
+# -----------------------------------------------------------------------------
+# Dispatch
+# -----------------------------------------------------------------------------
+case "${1:-}" in
+  status)         cmd_status ;;
+  list)           cmd_list ;;
+  import)         shift; cmd_import "${1:-}" ;;
+  remove)         shift; cmd_remove "$@" ;;
+  start)          shift; cmd_start "$@" ;;
+  stop)           cmd_stop ;;
+  restart)        shift; cmd_restart "$@" ;;
+  toggle)         shift; cmd_toggle "$@" ;;
+  ping)           shift; cmd_ping "$@" ;;
+  link)           shift; cmd_link "$@" ;;
+  log)            shift; cmd_log "$@" ;;
+  autostart)      shift; cmd_autostart "$@" ;;
+  install-engine) cmd_install_engine ;;
+  install-xray)   cmd_install_xray ;;
+  debug)          shift; cmd_debug "${1:-}" ;;
+  reveal)         cmd_reveal ;;
+  version)        echo "$VERSION" ;;
+  ""|-h|--help)
+    sed -n '/^# SUBCOMMANDS/,/^# EXIT CODES/p' "$0" | sed 's/^# \?//' | grep -v '^$'
+    exit 0
+    ;;
+  *)
+    emit_error "unknown subcommand: $1"
+    ;;
+esac
