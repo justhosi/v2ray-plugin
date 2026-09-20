@@ -121,35 +121,112 @@ omarchy plugin update community.v2ray-client
 4. **Click the row** to connect. The row gets an accent dot, the subtitle reads
    "Connected", and the bar shield fills in.
 
-### Then point something at it
+### Then point an app at it
 
-Connection alone does not move anyone's traffic — see the next section.
+**This is the step people skip, and then think the plugin is broken.** Connecting
+only *opens* the tunnel — it does not reroute anything by itself. Until an app is
+told to use it, that app keeps talking to the internet directly, on your real IP.
 
-The engine only listens on two local ports:
+The engine listens on two doors:
 
-```
-SOCKS5   127.0.0.1:10808
-HTTP     127.0.0.1:10809
-```
+| door | address | use it for |
+|---|---|---|
+| **SOCKS5** | `127.0.0.1:10808` | browsers and most things — it also carries DNS, so lookups do not leak |
+| **HTTP** | `127.0.0.1:10809` | the occasional app that only understands an "HTTP proxy" |
 
-So the quickest proof that the tunnel works is a terminal:
+Prefer the SOCKS5 one. The popup has a **copy** button for the SOCKS5
+address and another for the ready-made `all_proxy` line, so you never have to
+retype either.
+
+#### Prove it in a terminal first
 
 ```bash
-# Direct: shows your real IP
+# Direct: prints your real IP
 curl -s https://api.ipify.org; echo
-# Through the tunnel: shows the server's IP
+# Through the tunnel: prints the server's IP
 curl -s --proxy socks5h://127.0.0.1:10808 https://api.ipify.org; echo
 ```
 
-Two different addresses means the tunnel is fine. To make an app use it, either
-set `127.0.0.1:10808` as its SOCKS5 proxy, or start it from a terminal that has:
+Two **different** addresses means the tunnel is healthy and the problem — if any
+— is in the app's settings, not here.
+
+#### Worked example: Brave
+
+Brave is Chromium underneath, so it takes a `--proxy-server` switch. Three ways,
+easiest first.
+
+**1. Try it right now (nothing is saved).** Close Brave completely, then:
 
 ```bash
-export all_proxy=socks5h://127.0.0.1:10808
+brave --proxy-server="socks5://127.0.0.1:10808"
 ```
 
-The popup has a **copy** button for that exact line, and another for the proxy
-address, so you never have to retype them.
+**2. Check it worked.** In that Brave window, open `https://api.ipify.org`. It
+must show the **server's** address, not yours. You can also open
+`brave://net-internals/#proxy` and read the "Effective proxy settings" line —
+it should name `socks5://127.0.0.1:10808`.
+
+**3. Make it permanent.** Give your user a private copy of Brave's launcher so a
+system update cannot undo the edit:
+
+```bash
+mkdir -p ~/.local/share/applications
+cp /usr/share/applications/brave-browser.desktop ~/.local/share/applications/
+```
+
+Now open that file in a text editor, find the first line starting with `Exec=`,
+and add the switch to it:
+
+```ini
+Exec=brave %U                                                      # before
+Exec=brave --proxy-server="socks5://127.0.0.1:10808" %U             # after
+```
+
+(That is the real first `Exec=` line in Brave's launcher. Leave the other
+`Exec=` lines — the incognito and new-window ones — alone unless you want those
+tunnelled too.)
+
+Save, and start Brave from the launcher as usual. To undo, delete the copy:
+
+```bash
+rm ~/.local/share/applications/brave-browser.desktop
+```
+
+> **Leave the flag off and Brave is untouched.** The switch only exists in that
+> one launcher, so your normal Brave still uses your normal connection — handy
+> for keeping a "tunnelled" and a "direct" Brave side by side.
+
+#### What about every other app?
+
+* **A GUI app with its own proxy setting** (most chat apps, some editors):
+  paste `127.0.0.1` / `10808` and pick **SOCKS5**.
+* **A terminal program** (`curl`, `git`, `wget`, `pip`…): start it with the
+  environment variable, which is the line the popup's copy button gives you:
+
+  ```bash
+  export all_proxy=socks5h://127.0.0.1:10808
+  ```
+
+  The `h` in `socks5h` matters: it sends hostnames to the proxy instead of
+  resolving them locally, so your DNS lookups stay inside the tunnel too.
+
+* **Every app you start after logging in**, with no root and no code — a
+  systemd user environment file:
+
+  ```bash
+  mkdir -p ~/.config/environment.d
+  printf 'all_proxy=socks5h://127.0.0.1:10808\n' > ~/.config/environment.d/v2ray.conf
+  ```
+
+  Log out and back in for it to take effect. This covers most apps that read
+  proxy environment variables, but **not** all of them — apps that ignore the
+  environment, and anything already running, will still go direct. It also
+  applies whether or not the tunnel is up, so a stopped engine means those apps
+  simply fail to connect. Delete the file to undo it.
+
+There is deliberately **no TUN mode**: hijacking all system traffic needs root,
+and a bar widget must never prompt for a password. That is a real limitation,
+not an oversight — see "Extending" below for the supported way to add it.
 
 ### Every interaction
 
@@ -195,22 +272,20 @@ latency probe) is running.
 
 ### What "connect" actually does
 
-The engine binds the two local proxies above and nothing else.
+The engine binds the two local proxies and nothing else. It never touches your
+routing table, your DNS, or any other app's traffic. "Connected" therefore means
+*the tunnel is open*, not *your traffic is inside it* — and that gap is the
+single most common "it isn't working" report, which is why the section above
+exists.
 
-**This proxy is not system-wide.** "Connected" means the engine is up and its
-local port is open. It does **not** mean your traffic is going through it. Only
-apps that were told to use `127.0.0.1:10808` are tunnelled, so a browser with no
-proxy configured happily keeps loading pages *and* keeps showing your real IP —
-the single most common "it isn't working" report. The two `curl` commands above
-tell you which of the two you are looking at.
+One useful consequence: nothing else on your machine can break because of this
+plugin. Stop the engine and the only thing that changes is that apps pointed at
+`127.0.0.1:10808` lose their tunnel; everything else carries on as before.
 
-If the "direct" command also shows the server's IP, then something else on your
-system (tun2socks, another VPN, a proxy environment variable) is already routing
-everything, and this plugin is redundant.
-
-There is deliberately **no TUN mode**: hijacking all system traffic needs root,
-and a bar widget must never prompt for a password. That is a real limitation,
-not an oversight — see "Extending" below for the supported way to add it.
+If your *direct* `curl` (the one without `--proxy`) already reports the server's
+IP, then something else — tun2socks, another VPN, your router's own v2ray, a
+proxy environment variable — is routing everything, and this plugin is redundant
+on that machine.
 
 ---
 
