@@ -43,7 +43,9 @@
 # -----------
 #   status              Engine/profile/connection state as one JSON object.
 #   list                Every imported profile as a JSON array.
-#   import              Read {id,meta,config} JSON on stdin, write a profile.
+#   import              Read {id,meta,config} JSON on STDIN, write a profile.
+#                       (stdin only, on purpose: an argv or environment payload
+#                       would expose the UUID — see cmd_import.)
 #   remove <id>         Delete a profile (and disconnect it if it was active).
 #   start <id>          Launch the engine against a profile.
 #   stop                Stop the engine.
@@ -103,6 +105,14 @@ PING_TIMEOUT="${OMARCHY_V2RAY_PING_TIMEOUT:-8}"
 # The debug command gives the dial more room than the ping does: a slow or
 # filtered route should be *reported*, not cut off before it can fail.
 DEBUG_TIMEOUT="${OMARCHY_V2RAY_DEBUG_TIMEOUT:-12}"
+
+# Bounds for reading an import payload off stdin. A real xray config is ~1 KB;
+# these ceilings exist so a caller that opens the pipe and never closes it can
+# neither hang this process forever nor make it allocate without bound. A read
+# that hits either ceiling produces JSON that fails validation below, so it is
+# rejected before anything is written — never a half-written profile.
+IMPORT_MAX_BYTES="${OMARCHY_V2RAY_IMPORT_MAX_BYTES:-262144}"
+IMPORT_READ_TIMEOUT="${OMARCHY_V2RAY_IMPORT_TIMEOUT:-15}"
 
 # -----------------------------------------------------------------------------
 # Output helpers.
@@ -484,27 +494,53 @@ cmd_list() {
 # We only validate and persist. Re-importing the same link produces the same id,
 # so it updates the existing profile instead of creating a duplicate.
 #
-# We accept the payload on stdin rather than argv because an xray config can be
-# large, and argv is limited by ARG_MAX.
+# THE PAYLOAD IS ACCEPTED ON STDIN AND NOWHERE ELSE
+# ------------------------------------------------
+# `config` carries the tunnel's credentials: the VLESS/Vmess user UUID, or the
+# Trojan/Shadowsocks password. Two otherwise convenient channels are therefore
+# off limits, and this is not theoretical — they are world-readable:
+#
+#   * argv. A command line can be read by any user on the machine for as long as
+#     the process runs (`ps -ww`, /proc/<pid>/cmdline — no privileges needed), so
+#     an argument payload paints the user's UUID into the process table, into
+#     `top`/`htop`, into anything that samples or logs processes, and into the
+#     shell history of whoever typed it. `import "<payload>"` was the original
+#     calling convention; it is refused now, loudly, so an old invocation cannot
+#     quietly keep leaking.
+#   * the environment. $OMARCHY_V2RAY_PAYLOAD was the second convenience path and
+#     is gone for exactly the same reason: /proc/<pid>/environ is equally public,
+#     and it survives in the parent's environment block besides.
+#
+# Stdin is a pipe held only by the caller and this process, so it is the one
+# channel we read. The panel writes the JSON there and closes the pipe (see
+# Service.qml); the read below is bounded in size and in time so that a caller
+# who forgets to close cannot hang us or exhaust memory.
+#
+# Note that the payload is also never echoed: every diagnostic below describes
+# the *shape* of the problem ("invalid import payload") and never quotes the
+# offending text, because that text is a secret.
 cmd_import() {
   ensure_dirs
 
-  # The payload can arrive three ways, in priority order:
-  #   1. as an argument            — what the QML panel uses (no stdin hazards)
-  #   2. in $OMARCHY_V2RAY_PAYLOAD — handy for systemd units and other callers
-  #   3. on stdin                  — what humans and scripts use
-  # A config is well under ARG_MAX, so an argument is the simplest safe path.
-  local payload="${1:-}"
-  if [[ -z $payload ]]; then
-    if [[ -n ${OMARCHY_V2RAY_PAYLOAD:-} ]]; then
-      payload="$OMARCHY_V2RAY_PAYLOAD"
-    elif [[ -t 0 ]]; then
-      emit_error "no payload: pass JSON as an argument, set OMARCHY_V2RAY_PAYLOAD, or pipe it on stdin"
-    else
-      payload="$(cat)"
-    fi
+  # An argv payload is refused rather than ignored: a caller following an older
+  # README must be told that its import did not happen.
+  if (($# > 0)); then
+    emit_error "refusing an argv payload (a command line is world-readable via /proc) — pipe the JSON on stdin instead"
   fi
-  [[ -n $payload ]] || emit_error "empty import payload"
+
+  # A tty on stdin means a human typed `omarchy-v2ray import` and is now waiting
+  # for a prompt that will never come. Say what is expected instead of reading.
+  if [[ -t 0 ]]; then
+    emit_error "no payload: pipe the {id,meta,config} JSON on stdin, e.g. omarchy-v2ray import < payload.json"
+  fi
+
+  # `timeout` bounds how long we wait for the writer to close the pipe, `head -c`
+  # bounds how much of it we take. Either one being hit leaves us with text that
+  # cannot pass the validation below, which is the safe outcome: a truncated read
+  # is rejected, never written.
+  local payload
+  payload="$(timeout "$IMPORT_READ_TIMEOUT" head -c "$IMPORT_MAX_BYTES" || true)"
+  [[ -n $payload ]] || emit_error "empty import payload: pipe the {id,meta,config} JSON on stdin"
 
   # Validate the shape before touching the filesystem.
   echo "$payload" | jq -e '
@@ -513,7 +549,7 @@ cmd_import() {
       and (.config | type == "object")
       and ((.config.inbounds | type) == "array")
       and ((.config.outbounds | type) == "array")
-    ' >/dev/null 2>&1 || emit_error "invalid import payload"
+    ' >/dev/null 2>&1 || emit_error "invalid import payload: expected {id,meta,config} JSON on stdin, at most $IMPORT_MAX_BYTES bytes"
 
   local id
   id="$(echo "$payload" | jq -r '.id')"
@@ -1302,7 +1338,7 @@ cmd_reveal() {
 case "${1:-}" in
   status)         cmd_status ;;
   list)           cmd_list ;;
-  import)         shift; cmd_import "${1:-}" ;;
+  import)         shift; cmd_import "$@" ;;
   remove)         shift; cmd_remove "$@" ;;
   start)          shift; cmd_start "$@" ;;
   stop)           cmd_stop ;;

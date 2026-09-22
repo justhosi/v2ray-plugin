@@ -102,7 +102,11 @@ chmod +x "$FAKEBIN/xray" "$FAKEBIN/ss" "$FAKEBIN/curl"
 # sni is example.com, so the openssl probes the debug report runs fail instantly
 # instead of dialling a stranger on real hardware.
 ID="test-reality"
-"$BACKEND" import "$(cat <<JSON
+# The credential this fixture carries. The cases below use it to prove that the
+# UUID never reaches a command line, the environment, or any output.
+UUID="11111111-2222-3333-4444-555555555555"
+
+cat >"$WORK/payload.json" <<JSON
 {
   "id": "$ID",
   "meta": {
@@ -138,11 +142,42 @@ ID="test-reality"
   }
 }
 JSON
-)" >/dev/null 2>&1
+
+# The payload goes in on stdin, which is the only channel the backend accepts
+# (see cmd_import). The panel does exactly the same through Quickshell's Process.
+"$BACKEND" import <"$WORK/payload.json" >/dev/null 2>&1
 if ! "$BACKEND" list 2>/dev/null | jq -e --arg id "$ID" 'any(.id == $id)' >/dev/null; then
   echo "could not import the test profile" >&2; exit 1
 fi
 echo "test profile: $ID"
+
+# =============================================================================
+echo
+echo "case 0: the credential must not be able to travel in argv or the environment"
+# The panel used to hand the payload to the backend as an ARGUMENT:
+#   bin/omarchy-v2ray import "$(jq -c . payload.json)"
+# That put the profile's UUID in the child's command line, where every user on
+# the machine can read it for as long as the process lives (`ps -ww`,
+# /proc/<pid>/cmdline need no privileges) — the leak this whole suite guards
+# against, and the reason the payload now goes over stdin.
+#
+# A DIFFERENT id is used here, so that a regression is visible as an extra
+# profile rather than as a silent update of the existing one.
+argv_payload="$(jq -c '.id = "argv-leak-should-not-exist"' "$WORK/payload.json")"
+
+out="$("$BACKEND" import "$argv_payload" 2>/dev/null)"
+check "an argv payload is refused" jq -e '.ok == false' <<<"$out"
+check_contains "the refusal points at stdin" "$(jq -r '.error' <<<"$out")" "stdin"
+check "the refusal does not echo the credential" test "${out#*$UUID}" = "$out"
+check "nothing was written from argv" test -z "$("$BACKEND" list 2>/dev/null \
+  | jq -r '.[] | select(.id == "argv-leak-should-not-exist") | .id')"
+
+# The environment was the second convenience path ($OMARCHY_V2RAY_PAYLOAD) and is
+# equally readable via /proc/<pid>/environ, so it must be inert now.
+out="$(OMARCHY_V2RAY_PAYLOAD="$argv_payload" "$BACKEND" import </dev/null 2>/dev/null)"
+check "an environment payload is refused too" jq -e '.ok == false' <<<"$out"
+check "nothing was written from the environment" test -z "$("$BACKEND" list 2>/dev/null \
+  | jq -r '.[] | select(.id == "argv-leak-should-not-exist") | .id')"
 
 # =============================================================================
 echo
@@ -211,6 +246,24 @@ evil="subject=CN=www.google.com issuer=C=US, O=Suspicious Interceptor, CN=Proxy-
 check "WE2 and WR2 count as the same signer" test "$(ca "$we2")" = "$(ca "$wr2")"
 check "a different organisation is NOT the same signer" test "$(ca "$we2")" != "$(ca "$evil")"
 check "the organisation is what is compared" test "$(ca "$we2")" = "Google Trust Services"
+
+# =============================================================================
+echo
+echo "case 5: the panel cannot quietly reintroduce the leak"
+# The backend refusing an argv payload only helps if the panel stops sending
+# one, so assert on the caller too: the payload must be handed to runAction() as
+# its third (stdin) argument, and no credential-bearing text may be woven into a
+# shell command line.
+SERVICE="$HERE/../Service.qml"
+check "the panel passes no payload in the import command list" \
+  bash -c '! grep -qE "\"import\", *JSON" "$1"' _ "$SERVICE"
+check_contains "the panel passes it as runAction()'s stdin argument" "$(cat "$SERVICE")" \
+  'runAction(["bash", scriptPath, "import"], String(payload.id), JSON.stringify(payload))'
+check "the panel enables stdin for that child" bash -c 'grep -q "stdinEnabled" "$1"' _ "$SERVICE"
+# `bash -c "<string built from app data>"` is how a credential reaches argv, so
+# the panel must not do it at all (the clipboard used to).
+check "the panel never builds a shell command line" \
+  bash -c '! grep -qE "\"bash\", *\"-c\"" "$1"' _ "$SERVICE"
 
 # =============================================================================
 echo

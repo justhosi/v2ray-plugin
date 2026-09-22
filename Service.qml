@@ -25,12 +25,26 @@ import "Model.js" as Model
 // with `setsid`, fully detached, and this process only ever asks about it.
 // See start_profile() in bin/omarchy-v2ray for the details.
 //
-// STDIN IS AVOIDED ON PURPOSE
-// ---------------------------
-// Quickshell's Process does support stdin, but the write channel's close
-// semantics are subtle enough that a `cat`-based reader could hang forever.
-// Import payloads are therefore passed as an argv element — a config is ~1 KB,
-// far below any argv limit, and the behaviour is completely deterministic.
+// SECRETS TRAVEL ON STDIN, NEVER IN argv
+// --------------------------------------
+// An import payload contains the tunnel's credential: the VLESS/Vmess user UUID,
+// or the Trojan/Shadowsocks password. A command line is readable by EVERY user
+// on the machine for as long as the process lives — `ps -ww`,
+// /proc/<pid>/cmdline and /proc/<pid>/environ need no privileges — so a
+// credential must never be an argument, an environment variable, or a line in a
+// log. The import payload therefore goes to the backend on the child's stdin,
+// which is a pipe only these two processes hold. (The backend refuses an argv
+// payload outright — see cmd_import in bin/omarchy-v2ray — and reads nothing
+// from the environment, so the leak cannot come back by accident.)
+//
+// The same rule covers the clipboard: a share link *is* the credential once it
+// carries the UUID, so it is written to wl-copy's stdin rather than handed to
+// `bash -c "printf %s '…' | wl-copy"`, which would park it in bash's argv.
+//
+// Closing the write channel is what signals EOF to the reader, so the shape is:
+// `stdinEnabled = true` before starting, `write(...)` in onStarted, and then
+// `stdinEnabled = false` to close. It is the same pattern the bundled network
+// panel uses to hand a Wi-Fi password to nmcli.
 // =============================================================================
 
 Item {
@@ -280,11 +294,25 @@ Item {
   // ---------------------------------------------------------------------------
   // Actions
   // ---------------------------------------------------------------------------
-  function runAction(command, rowId) {
+  // runAction(command, rowId, stdinPayload)
+  //
+  // Runs one backend action. `stdinPayload` is optional, and is written to the
+  // child's stdin before that pipe is closed. Only the import path passes one:
+  // its payload is a secret, and stdin is the one channel a process does not
+  // publish to the rest of the machine.
+  function runAction(command, rowId, stdinPayload) {
     if (actionProc.running) return
     clearMessages()
     busy = true
     actionRowId = String(rowId || "")
+    // Park the payload where onStarted can pick it up; it is dropped again the
+    // moment it has been written, so the secret is not kept in a property.
+    _actionStdin = (stdinPayload === undefined || stdinPayload === null)
+      ? ""
+      : String(stdinPayload)
+    // Decided BEFORE `running`: the flag is what makes the child start with a
+    // writable stdin at all. Non-import actions leave it false.
+    actionProc.stdinEnabled = _actionStdin !== ""
     actionProc.command = command
     actionProc.running = true
   }
@@ -341,6 +369,7 @@ Item {
   //    pleasant and mistakes produce a friendly message.
   // 2. Build the complete engine config + metadata.
   // 3. Hand the whole thing to the backend, which only validates and writes.
+  //    Over stdin, because the payload is the credential (see the header note).
   //
   // Returns true when the link was accepted (so the panel knows whether to
   // clear the text field).
@@ -371,7 +400,10 @@ Item {
       return false
     }
 
-    runAction(["bash", scriptPath, "import", JSON.stringify(payload)], String(payload.id))
+    // Note the third argument: the JSON travels on the child's stdin, NOT in
+    // its command list. As an argument it would be visible to every user on the
+    // machine through /proc for the whole import.
+    runAction(["bash", scriptPath, "import"], String(payload.id), JSON.stringify(payload))
     importingId = String(payload.id)
     importingName = String(parsed.profile.name || parsed.profile.host)
     return true
@@ -386,9 +418,14 @@ Item {
   function copyToClipboard(value) {
     var text = String(value || "")
     if (text === "") return
-    // printf %s avoids a trailing newline, which would otherwise become part of
-    // whatever the user pastes next.
-    Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text) + " | wl-copy"])
+    // The text goes to wl-copy on stdin, never in an argument: what gets copied
+    // here is often a profile's share link, which carries the UUID itself, and
+    // `bash -c "printf %s '<link>' | wl-copy"` publishes that to every user on
+    // the machine through /proc while it runs. wl-copy copies stdin verbatim, so
+    // there is also no trailing newline to become part of the next paste.
+    if (clipProc.running) clipProc.running = false    // supersede an older copy
+    _clipText = text
+    clipProc.running = true
     // Tell the user the click landed. wl-copy is silent — no window, no sound —
     // so without this a copy is indistinguishable from a dead button. The row
     // button ALSO swaps its glyph for a check mark; two signals on purpose.
@@ -502,11 +539,29 @@ Item {
   // one JSON object, refresh", and serialising them keeps state predictable.
   property string _actionOut: ""
   property string _actionErr: ""
+  // Import payload waiting to be written to the child's stdin. Empty for every
+  // other action, and always cleared once written. See runAction().
+  property string _actionStdin: ""
 
   Process {
     id: actionProc
     running: false
     command: []
+    // Off by default (nothing else we run wants stdin); runAction() turns it on
+    // for an import only.
+    stdinEnabled: false
+    onStarted: {
+      // The import payload goes over the pipe, never argv — a command line is
+      // world-readable while the process runs. Writing first and closing after
+      // is the safe order: the queued bytes are flushed before the channel
+      // shuts, and closing is what tells the backend that the JSON is complete
+      // (it reads until EOF, with its own timeout as a backstop).
+      if (root._actionStdin !== "") {
+        actionProc.write(root._actionStdin)
+        root._actionStdin = ""
+      }
+      actionProc.stdinEnabled = false
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root._actionOut = text
@@ -523,6 +578,10 @@ Item {
       root.busy = false
       root.actionRowId = ""
       root._pendingRunning = -1
+      // Belt and braces: whatever happened, do not keep a copy of the payload
+      // in a property or a half-open write channel for the next action to see.
+      root._actionStdin = ""
+      actionProc.stdinEnabled = false
 
       if (res && res.ok === true) {
         if (wasImport) {
@@ -604,6 +663,28 @@ Item {
       }
       pingProc.pingId = ""
       root.pingingId = ""
+    }
+  }
+
+  // ---- clipboard ----
+  // The sink behind copyToClipboard(). Text arrives on stdin so that a share
+  // link — i.e. a credential — never lands in a command line; this is the whole
+  // reason it is a Process here instead of a `bash -c` one-liner.
+  property string _clipText: ""
+
+  Process {
+    id: clipProc
+    running: false
+    command: ["wl-copy"]
+    stdinEnabled: true
+    onStarted: {
+      clipProc.write(root._clipText)
+      root._clipText = ""
+      clipProc.stdinEnabled = false   // EOF: wl-copy takes the clipboard now
+    }
+    onExited: function(exitCode) {
+      root._clipText = ""
+      clipProc.stdinEnabled = true    // re-arm for the next copy
     }
   }
 }

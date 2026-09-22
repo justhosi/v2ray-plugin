@@ -339,11 +339,20 @@ bin/omarchy-v2ray link <id>           # print the share link
 bin/omarchy-v2ray log 50
 bin/omarchy-v2ray autostart <id>|off
 bin/omarchy-v2ray remove <id>
-bin/omarchy-v2ray import "$(cat payload.json)"
+bin/omarchy-v2ray import < payload.json   # JSON on stdin — and only on stdin
 ```
 
 This is the file to read when something breaks: it is plain bash, it needs no
 display, and it explains itself.
+
+> **Why `import` refuses arguments.** The payload contains your UUID (or your
+> Trojan/Shadowsocks password). A command line and an environment block are
+> readable by *every* user on the machine for as long as the process runs —
+> `ps -ww`, `/proc/<pid>/cmdline` and `/proc/<pid>/environ` need no privileges —
+> so the payload is accepted on stdin only, which is a pipe held just by the
+> caller. The same reasoning governs the widget: it writes the payload to the
+> backend's stdin instead of passing it as an argument, and it feeds the
+> clipboard (where a share link *is* the credential) the same way.
 
 ---
 
@@ -570,8 +579,10 @@ profiles or your tunnel.
 ```
 
 It covers the signer comparison (`WE2` vs `WR2` must *not* be an alarm), the two
-handshake verdicts, the collapsed error text, and the `set -u` trap that once made
-`debug` abort with `sni: unbound variable`.
+handshake verdicts, the collapsed error text, the `set -u` trap that once made
+`debug` abort with `sni: unbound variable`, and the credential-handling rules:
+an `import` payload is refused on argv and in the environment, and the widget is
+checked for the argv pattern that used to leak the UUID through `/proc`.
 
 ---
 
