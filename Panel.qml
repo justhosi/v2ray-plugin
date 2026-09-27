@@ -38,7 +38,8 @@ Panel {
   moduleName: "community.v2ray-client"
   ipcTarget: "community.v2ray-client"
   // The base Panel installs a minimal open/close IpcHandler; we replace it
-  // below with one that also exposes refresh/connect/import.
+  // below with one that also exposes refresh and connect. There is deliberately
+  // no import entry point — see the note inside IpcHandler.
   manageIpc: false
 
   implicitWidth: button.implicitWidth
@@ -209,11 +210,28 @@ Panel {
     function refresh(): string { v2ray.refresh(); return "ok" }
     function connection(): string { v2ray.toggleConnection(); return "ok" }
     function status(): string { return v2ray.statusLine() }
-    // Returns "ok" or the parser's complaint, so a shell script can import a
-    // link without reading the panel: omarchy-shell … importLink "vless://…"
-    function importLink(link: string): string {
-      return v2ray.importLink(link) ? "ok" : v2ray.lastError
-    }
+
+    // THERE IS DELIBERATELY NO IMPORT FUNCTION ON THIS INTERFACE.
+    //
+    // `qs ipc call <target> <function> <arguments…>` delivers every argument as
+    // a positional string on the CALLER's command line; Quickshell's IPC has no
+    // stdin channel to hand it over instead (checked against Quickshell 0.3.1:
+    // a literal `-` is passed through as text, not read from stdin). A command
+    // line is readable by every user on the machine for as long as the process
+    // lives (`ps -ww`, /proc/<pid>/cmdline need no privileges) and is kept in
+    // the shell history of whoever typed it.
+    //
+    // An import is the one action whose argument would BE the credential — the
+    // share link carries the VLESS/Vmess UUID or the Trojan/Shadowsocks
+    // password — so a public import handler could only ever be the argv leak
+    // this plugin refuses everywhere else (see cmd_import in bin/omarchy-v2ray
+    // and the header of Service.qml). It was removed rather than re-plumbed,
+    // because there is no safe channel to re-plumb it through.
+    //
+    // Every function above is argument-free for the same reason: one rule, "no
+    // credential may ride in a command line", covers the whole target. The
+    // normal way in is the popup — the pasted link stays a QML string, and
+    // Service.importLink() writes the built payload to the backend's stdin.
   }
 
   // ---------------------------------------------------------------------------

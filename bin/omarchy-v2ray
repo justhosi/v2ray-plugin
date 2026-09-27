@@ -108,9 +108,14 @@ DEBUG_TIMEOUT="${OMARCHY_V2RAY_DEBUG_TIMEOUT:-12}"
 
 # Bounds for reading an import payload off stdin. A real xray config is ~1 KB;
 # these ceilings exist so a caller that opens the pipe and never closes it can
-# neither hang this process forever nor make it allocate without bound. A read
-# that hits either ceiling produces JSON that fails validation below, so it is
-# rejected before anything is written — never a half-written profile.
+# neither hang this process forever nor make it allocate without bound.
+#
+# Both ceilings are *refusals*, not silent truncations. A reader capped at
+# exactly the ceiling cannot tell a complete payload of that size from a larger
+# one it has just cut off, and a cut landing just past a valid JSON document
+# would be stored with its tail quietly dropped. The reader therefore asks for
+# one byte MORE than the ceiling and refuses whatever produced it (see
+# cmd_import); a read that reaches the wall clock without EOF is refused too.
 IMPORT_MAX_BYTES="${OMARCHY_V2RAY_IMPORT_MAX_BYTES:-262144}"
 IMPORT_READ_TIMEOUT="${OMARCHY_V2RAY_IMPORT_TIMEOUT:-15}"
 
@@ -133,10 +138,29 @@ emit_ok() {
 }
 
 ensure_dirs() {
-  mkdir -p "$PROFILES_DIR" "$STATE_DIR"
-  # umask 077 => new files are 0600 and new dirs 0700, so the UUID inside a
-  # config is never world-readable.
+  # The umask comes FIRST, before anything is created. It is what makes every
+  # directory of this tree 0700 and every file in it 0600, and the tree holds
+  # the credential itself (the UUID or password inside <id>.config.json), so it
+  # has to be private from the very first byte.
+  #
+  # This is a fix, not a tidy-up: the umask used to be set *after* the mkdir, so
+  # a first-ever run created CONFIG_DIR, profiles/ and state/ with whatever umask
+  # the user had (022 on a stock shell) — 0755, world-listable. The files inside
+  # were still 0600, so no UUID was ever readable, but `ls` on the profiles
+  # directory published the profile ids (`<name>-<hash>`, i.e. which servers the
+  # user has) to every local user. A validation pass on a cold start caught it.
   umask 077
+
+  mkdir -p "$PROFILES_DIR" "$STATE_DIR"
+
+  # Repair a tree an older version already created: mkdir -p never changes the
+  # mode of a directory that exists, so an install left at 0755 would stay
+  # listable for the life of the machine. These three directories are ours to
+  # own, so set them explicitly on every call (idempotent, and cheap next to the
+  # jq work that follows). Failures are ignored on purpose — an
+  # OMARCHY_V2RAY_HOME the user pointed at a path they cannot chmod is not a
+  # reason to refuse an import.
+  chmod 700 "$CONFIG_DIR" "$PROFILES_DIR" "$STATE_DIR" 2>/dev/null || true
 }
 
 # -----------------------------------------------------------------------------
@@ -514,7 +538,9 @@ cmd_list() {
 # Stdin is a pipe held only by the caller and this process, so it is the one
 # channel we read. The panel writes the JSON there and closes the pipe (see
 # Service.qml); the read below is bounded in size and in time so that a caller
-# who forgets to close cannot hang us or exhaust memory.
+# who forgets to close cannot hang us or exhaust memory. Both bounds refuse the
+# read outright: an over-large payload is never truncated to fit, and EOF — not
+# the clock — is what marks the end of a payload.
 #
 # Note that the payload is also never echoed: every diagnostic below describes
 # the *shape* of the problem ("invalid import payload") and never quotes the
@@ -534,13 +560,41 @@ cmd_import() {
     emit_error "no payload: pipe the {id,meta,config} JSON on stdin, e.g. omarchy-v2ray import < payload.json"
   fi
 
-  # `timeout` bounds how long we wait for the writer to close the pipe, `head -c`
-  # bounds how much of it we take. Either one being hit leaves us with text that
-  # cannot pass the validation below, which is the safe outcome: a truncated read
-  # is rejected, never written.
-  local payload
-  payload="$(timeout "$IMPORT_READ_TIMEOUT" head -c "$IMPORT_MAX_BYTES" || true)"
+  # `timeout` bounds how long we wait for the writer to close the pipe; `head -c`
+  # bounds how much of it we take — one byte MORE than the ceiling, so that an
+  # over-large payload is visible instead of being silently cut to fit. Capped at
+  # the ceiling exactly, this read could not tell "a complete payload of that
+  # size" from "a larger payload cut off here", and a cut landing just past a
+  # valid JSON document would import with its tail quietly dropped.
+  #
+  # The status trailer is appended INSIDE the capture, where it does two jobs:
+  # it stops the shell from stripping trailing newlines off the payload (a
+  # payload padded with newlines past the ceiling would otherwise shrink to
+  # almost nothing and look like a perfectly good small payload), and it carries
+  # `head`'s exit status — 124 means `timeout` gave up on a writer that never
+  # closed the pipe. SOH (\001) cannot occur in JSON text, so it can never be
+  # confused with the payload itself.
+  local captured read_status payload payload_bytes
+  local sep=$'\001'
+  captured="$( { timeout "$IMPORT_READ_TIMEOUT" head -c "$((IMPORT_MAX_BYTES + 1))"; printf '\001%s' "$?"; } )"
+  read_status="${captured##*"$sep"}"
+  payload="${captured%"$sep"*}"
+
+  # EOF is what marks the end of a payload, so a read that never saw it is
+  # incomplete: refuse it rather than accept a half-delivered stream.
+  if (( read_status == 124 )); then
+    emit_error "timed out after ${IMPORT_READ_TIMEOUT}s reading the import payload from stdin: the pipe was never closed"
+  fi
+  (( read_status == 0 )) || emit_error "could not read the import payload from stdin"
+
   [[ -n $payload ]] || emit_error "empty import payload: pipe the {id,meta,config} JSON on stdin"
+
+  # Compare BYTES, not ${#payload}: a character count would let multibyte text
+  # measure under the ceiling while being over it in bytes.
+  payload_bytes="$(printf '%s' "$payload" | wc -c)"
+  if (( payload_bytes > IMPORT_MAX_BYTES )); then
+    emit_error "import payload too large: at most $IMPORT_MAX_BYTES bytes"
+  fi
 
   # Validate the shape before touching the filesystem.
   echo "$payload" | jq -e '
@@ -549,7 +603,7 @@ cmd_import() {
       and (.config | type == "object")
       and ((.config.inbounds | type) == "array")
       and ((.config.outbounds | type) == "array")
-    ' >/dev/null 2>&1 || emit_error "invalid import payload: expected {id,meta,config} JSON on stdin, at most $IMPORT_MAX_BYTES bytes"
+    ' >/dev/null 2>&1 || emit_error "invalid or incomplete import payload: expected {id,meta,config} JSON on stdin, at most $IMPORT_MAX_BYTES bytes"
 
   local id
   id="$(echo "$payload" | jq -r '.id')"

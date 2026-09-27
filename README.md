@@ -544,6 +544,7 @@ plugin).
 | `Model.js` | share-link parsing and engine-config building |
 | `bin/omarchy-v2ray` | the backend CLI; every subcommand answers with JSON |
 | `tests/test-backend.sh` | the offline test suite |
+| `tests/test-service-import.sh` | drives the real panel under quickshell — import, clipboard and public IPC surface — to prove the credential never reaches argv |
 
 ## Extending it
 
@@ -582,7 +583,35 @@ It covers the signer comparison (`WE2` vs `WR2` must *not* be an alarm), the two
 handshake verdicts, the collapsed error text, the `set -u` trap that once made
 `debug` abort with `sni: unbound variable`, and the credential-handling rules:
 an `import` payload is refused on argv and in the environment, and the widget is
-checked for the argv pattern that used to leak the UUID through `/proc`.
+checked for the two argv patterns that used to leak the UUID through `/proc` —
+the import itself, and the clipboard copy, which now hands the link to a bare
+`wl-copy` on stdin.
+
+The same script ends by running `tests/test-service-import.sh`, which is the
+counterpart on the caller's side: it starts quickshell with the real
+`Service.qml`, imports a link carrying a sentinel credential, and reads the
+kernel's view of the process that panel spawned — `/proc/<pid>/cmdline`,
+`/proc/<pid>/environ` and its stdin — to show the secret travels on stdin and
+nowhere else. It replays the same import against the pre-fix `Service.qml` first,
+because an absence check that could never fail proves nothing.
+
+The same file then holds the panel's *public IPC surface* to that rule.
+`qs ipc call <target> <function> <arguments…>` puts every argument on the
+caller's command line and IPC has no stdin channel, so a public handler taking a
+share link would be an argv leak by construction — and `Panel.qml` used to
+publish exactly that (`importLink(link: string)`, with a comment encouraging
+`omarchy-shell … importLink "vless://…"`). The test loads the real `Panel.qml`,
+asks the running panel over its own IPC what it publishes, and fails if the old
+name is back *or* if any handler declares a parameter at all; the pre-fix
+`Panel.qml` is replayed as the control, where that signature has to appear.
+
+It needs
+quickshell and a Wayland session and prints `SKIP` without them, so the suite
+stays green headless, and can also be run on its own:
+
+```bash
+./tests/test-service-import.sh
+```
 
 ---
 
