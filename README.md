@@ -385,9 +385,27 @@ installs two pairs of `/1` routes — `0.0.0.0/1` and `128.0.0.0/1`, plus `::/1`
 and `8000::/1` for IPv6. Together they cover the whole address space and are more
 specific than the real default route, so the kernel prefers them without the
 helper replacing — and later having to guess at — your default route. Before the
-`/1`s exist it also pins every address of the proxy outbound to the physical
-uplink as a `/32` (or `/128`) route, so the engine's own dial out never falls
-back into the tun it is filling.
+`/1`s exist it resolves the proxy outbound's address once — while your system's
+own resolvers still answer, before DNS is moved into the tunnel — and rewrites it
+to that literal (the SNI/serverName is untouched, so only the dial target
+changes). That one literal is then pinned to the physical gateway as a `/32` (or
+`/128`) exemption, so the route names exactly what xray will dial. Direct traffic
+is kept out of the tun the other way round: see the next paragraph.
+
+Direct traffic stays off the tun by binding its socket, not by adding routes. The
+`direct` (freedom) outbound — which answers LAN, printer and any traffic the
+profile refuses to tunnel — used to have its private CIDRs pinned as routes,
+which could override a route that mattered (a VPN split tunnel, a bridge, a
+container network) and made teardown delete a route the helper never created. The
+helper now sets `streamSettings.sockopt.interface` on that outbound to the
+physical uplink, so a direct dial opens its socket on the link and never re-enters
+the tun, and no routing-table entry is touched at all. That is the price of not
+touching routes: a bound socket's route lookup is restricted to its device, so on
+a split-interface host an IPv6 direct dial bound to the IPv4 uplink fails, and a
+direct dial the table would have sent via another device — a second NIC, a VPN
+interface, a container bridge — is forced onto the default uplink and usually
+fails there too. An IP-literal server still gets its `/32`/`/128` exemption
+through the physical gateway.
 
 DNS is moved into the tunnel as soon as the interface exists. On a
 systemd-resolved machine the helper attaches `1.1.1.1` and `9.9.9.9` to the tun
@@ -399,16 +417,26 @@ it took first. Both are undone on the way out.
 `up` does not exit when the engine starts: it supervises. On every exit path —
 clean engine exit, crash, or a signal during the readiness window — it restores
 DNS (including the `resolvectl default-route` it set), removes the four `/1`
-routes and every per-server host route it recorded in
+routes and the server-exemption prefixes it recorded in
 `/run/omarchy-v2ray-tun/routes`, and deletes its state file, so a dead engine
 cannot leave the machine pointed at a tun device that no longer exists.
 `tun-down` does the same work explicitly and is safe when nothing is running.
 
+Stopping is prompt-free and escalates rather than guessing. `tun-down` signals
+the engine you own, waits ~5 s for the supervisor to clean up, and — only if the
+engine is still there because it ignored the signal — sends `SIGKILL` from your
+own session and waits ~3 s more; the privileged helper's password prompt is
+reached only if that still has not worked, worst case ~8 s after you asked to
+stop.
+
 "Connected" in TUN mode is evidence rather than optimism: the helper writes its
 state file only after the interface exists, the routes through it are installed
-and verified — a probe for `1.1.1.1` must come back through the tun and every
-server address must not — and the profile's SOCKS port is listening. `status`
-reports TUN as the connection only from that file. If the proof fails the start
+and verified — a probe address must come back through the tun and every server
+address must not — and the profile's SOCKS port is listening. The probe is not a
+fixed `1.1.1.1`: it walks `1.1.1.1`, then `8.8.8.8`, then `9.9.9.9`, skipping
+any candidate that is itself one of the profile's server addresses, so a server
+that happens to sit on the usual probe address cannot fail its own start.
+`status` reports TUN as the connection only from that file. If the proof fails the start
 fails instead: the panel shows the error rather than claiming a tunnel your
 traffic is still bypassing.
 
@@ -462,9 +490,10 @@ helper into a root-owned directory that `status` only ever reads:
 ├── last-error                   # why the last start failed               (0644)
 ├── engine.log                   # engine narration                        (0640)
 ├── helper.log                   # the helper's own log                    (0640)
-├── routes                       # the per-server host routes the helper
-│                                # installed, so `down` deletes exactly
-│                                # what `up` put in                        (0600)
+├── routes                       # the server-exemption prefixes the helper
+│                                # installed (`4 <ip>/32`, `6 <ip>/128`), so
+│                                # `down` deletes exactly what `up` put in —
+│                                # it never holds direct-range prefixes   (0600)
 └── config.json                  # the credential; deleted once the engine
                                  # has parsed it                           (0600)
 ```
@@ -501,9 +530,10 @@ bin/omarchy-v2ray import < payload.json   # JSON on stdin — and only on stdin
 
 `tun-up` prints a receipt and exits; the authorisation and the tunnel happen in
 the privileged process behind it, so poll `tun-status` for the result. `tun-down`
-needs no authorisation — it signals the engine you own and lets the still-running
-supervisor finish the root part — but it too returns before that finishes, so
-poll `tun-status` here as well. While TUN is active the backend refuses `start`
+needs no authorisation — it signals the engine you own, escalates to `SIGKILL` if
+the engine is still there ~5 s later, and lets the still-running supervisor finish
+the root part — but it too returns before that finishes, so poll `tun-status`
+here as well. While TUN is active the backend refuses `start`
 and `toggle`: the TUN engine owns the same local ports, and the way out is
 `tun-down`.
 
@@ -645,7 +675,9 @@ back with the routing.
 **How do I get out of TUN mode?** `bin/omarchy-v2ray tun-down`, or the switch
 itself — neither asks for a password, because the engine runs as you and your own
 session can stop it, while the root supervisor finishes restoring DNS and the
-routes. It is idempotent, it works after the profile has been deleted, and
+routes (and, if the engine ignores the polite signal, your session escalates to
+`SIGKILL` and waits a little longer before ever falling back to a password
+prompt). It is idempotent, it works after the profile has been deleted, and
 restoring DNS and removing the routes is its only job. `bin/omarchy-v2ray
 tun-status` is the read-only way to ask what is actually up. If the supervisor
 was killed outright, the next start recovers `/etc/resolv.conf` from its backup
@@ -657,17 +689,20 @@ helper got the interface up but could not *prove* the routing, so it tore
 everything back down rather than claim a tunnel your traffic would bypass. Either
 the kernel refused one of the routes it tried to install (there was no default
 route to pin the server against, or a conflicting route table), or its proof
-failed — a probe for `1.1.1.1` did not come back through the tun, or one of the
+failed — the probe address did not come back through the tun, or one of the
 server's addresses still resolved through it. Nothing is left half-on: the
 address, the `/1` routes and the server exemptions are all removed on the way
 out, so the machine is back on a normal direct connection.
 
-**A server named by hostname lost its exemption.** The server's address (or
-addresses) are looked up once, when TUN starts, and pinned to the physical uplink
-then. If the name points at a rotating set of IPs — a CDN or a load balancer — an
-address that appears after the start has no exemption, and the engine's own dial
-can fall into the tun. Re-start TUN to re-resolve the name and pin the current
-addresses.
+**A server named by hostname no longer connects after its address changed.** The
+server's name is resolved once, when TUN starts, and the proxy outbound's address
+is rewritten to that literal — so the `/32`/`/128` exemption names exactly what
+xray dials, and a dial can no longer slip past it into the tun. The flip side is
+that a changed address is not re-resolved: if the server moves to a new IP — a
+CDN or a load balancer rotating its records — the engine keeps dialling the pinned
+old address until you re-start TUN (`tun-down`, then `tun-up`), which resolves and
+pins the new one. The SNI/serverName is left alone throughout, so the certificate
+name you presented is unchanged.
 
 **Why can't I turn the proxy back on while TUN is up?** Both engines bind the
 same ports: the TUN config is the profile's config plus a tun inbound. The
