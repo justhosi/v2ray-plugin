@@ -121,6 +121,12 @@ printf '%s\n' "\$*" >>"$WORK/launcher.args"
 SH
 chmod +x "$FAKEBIN/omarchy-launch-floating-terminal-with-presentation"
 
+# (No getent stub here: the helper pins PATH to the system directories on
+# purpose, so a stub on PATH could never reach it. The hostname fixture below
+# uses `localhost`, which the real getent answers offline and deterministically
+# — the unit driver in case 1b covers the resolution mechanics with its own
+# getent function.)
+
 # --------------------------------------------------------------- fixtures ----
 # A profile in the shape the panel imports: a SOCKS inbound (the readiness probe
 # uses its port) plus one outbound. The credential is a sentinel so the cases
@@ -138,14 +144,58 @@ cat >"$PROFILES/$ID.config.json" <<JSON
   "outbounds": [
     { "tag": "proxy", "protocol": "vless",
       "settings": { "vnext": [ { "address": "203.0.113.10", "port": 443,
-        "users": [ { "id": "$UUID", "encryption": "none" } ] } ] } }
-  ]
+        "users": [ { "id": "$UUID", "encryption": "none" } ] } ] } },
+    { "tag": "direct", "protocol": "freedom" }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      { "type": "field", "outboundTag": "direct",
+        "ip": [ "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10" ] }
+    ]
+  }
 }
 JSON
 cat >"$PROFILES/$ID.meta.json" <<JSON
 { "id": "$ID", "name": "TUN Test", "type": "vless", "host": "203.0.113.10", "port": 443 }
 JSON
-chmod 600 "$PROFILES/$ID.config.json" "$PROFILES/$ID.meta.json"
+
+# A second profile whose server is a HOSTNAME: the pin step (resolve once,
+# rewrite the proxy outbound's address) only runs for a non-literal address, so
+# the plan's pin mirror and the /32 that follows it need this fixture. The
+# name is `localhost` on purpose: the helper pins its PATH, so a stub getent
+# could never answer it, and the real getent resolves localhost offline and
+# deterministically (127.0.0.1).
+ID_HOST="tun-test-host"
+cat >"$PROFILES/$ID_HOST.config.json" <<JSON
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    { "tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+      "settings": { "auth": "noauth", "udp": true } }
+  ],
+  "outbounds": [
+    { "tag": "proxy", "protocol": "vless",
+      "settings": { "vnext": [ { "address": "localhost", "port": 443,
+        "users": [ { "id": "$UUID", "encryption": "none" } ] } ] } },
+    { "tag": "direct", "protocol": "freedom" }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      { "type": "field", "outboundTag": "direct",
+        "ip": [ "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10" ] }
+    ]
+  }
+}
+JSON
+cat >"$PROFILES/$ID_HOST.meta.json" <<JSON
+{ "id": "$ID_HOST", "name": "TUN Host Test", "type": "vless", "host": "localhost", "port": 443 }
+JSON
+chmod 600 "$PROFILES/$ID.config.json" "$PROFILES/$ID.meta.json" \
+         "$PROFILES/$ID_HOST.config.json" "$PROFILES/$ID_HOST.meta.json"
 
 # Does this machine have an engine the helper's allowlist would accept? The
 # helper hard-codes those paths on purpose, so a fake xray on PATH cannot
@@ -190,6 +240,23 @@ if [[ $HAVE_XRAY == true ]]; then
       "$flat" "203.0.113.10/32"
   fi
 
+  # The direct (freedom) outbound is BOUND to the uplink at the socket level,
+  # not routed there: the plan must show the jq rewrite (sockopt.interface)
+  # and no direct-range route lines at all. The fixture profile's outbound is
+  # literal, so there is no pin step to show — the same no-op the real run
+  # performs.
+  check_contains "the plan binds the direct outbound to the uplink" \
+    "$flat" "sockopt"
+  check_contains "the bind names the detected uplink device" \
+    "$flat" "jq --arg iface "
+  check_not_contains "no direct-range route is planned" "$flat" \
+    "ip -4 route replace 10.0.0.0/8"
+  check_not_contains "no direct-range skip note is planned" "$flat" \
+    "skipped: loopback or link-local"
+  check_not_contains "no direct-range deletion is planned" "$flat" \
+    "route del 127.0.0.0/8"
+  check_not_contains "a literal profile shows no pin step" "$flat" "--arg ip "
+
   # S4: the profile transform is the USER's jq, not root's. The plan must show
   # the setpriv argv (the `| cat > config.json` root side is a redirect and is
   # therefore implied, not an argv element).
@@ -214,6 +281,33 @@ else
   check "up refuses without an allowlisted xray" jq -e '.ok == false and (.error | contains("omarchy pkg aur add xray"))' <<<"$out"
 fi
 
+# =============================================================================
+echo
+echo "case 1c: a hostname profile's plan shows the pin step, and the /32 follows it"
+# The pin exists so that xray's dial target IS the address the /32 exemption
+# names (see pin_server_address). The plan must show that rewrite happening
+# BEFORE the engine line, with the same temp + chown + chmod + mv discipline as
+# the build, and the exemption must use the pinned literal.
+if [[ $HAVE_XRAY == true ]]; then
+  out="$("$HELPER" up "$ID_HOST" 2>/dev/null)"; rc=$?
+  check "hostname up exits 0" test "$rc" -eq 0
+  flat_host="$(jq -r '.commands | join("\n")' <<<"$out")"
+  check_contains "the plan pins the resolved server address" "$flat_host" \
+    "--arg ip 127.0.0.1"
+  check_contains "the pinned config is handed back to the invoking user" "$flat_host" \
+    "chown $(id -u):$(id -g) -- $RUN/.config.json.tmp"
+  check_contains "the pin renames its temp into place" "$flat_host" \
+    "mv -f -- $RUN/.config.json.tmp $RUN/config.json"
+  check_not_contains "the pin step never exposes the profile's credential" \
+    "$flat_host" "$UUID"
+  if ip route show default >/dev/null 2>&1; then
+    check_contains "the plan exempts the pinned address, not the name's other records" \
+      "$flat_host" "ip -4 route replace 127.0.0.1/32"
+  fi
+  check_not_contains "no exemption is planned for the un-pinned name" "$flat_host" \
+    "localhost/32"
+fi
+
 # The engine must NOT inherit the transition lock's fd: a flock lock belongs to
 # the open file description, so the engine's inherited copy of fd 9 kept the
 # mutex held for the engine's whole life, and `down` hung for 20s and then
@@ -232,6 +326,273 @@ check "the engine is launched with the transition-lock fd closed (9>&-)" \
   grep -q '9>&-' "$WORK/start_engine.body"
 check "the lock-fd close sits on the engine's redirect line, not elsewhere" \
   grep -q '</dev/null 9>&- &' "$WORK/start_engine.body"
+
+# =============================================================================
+echo
+echo "case 1b: routing internals without root (socket binding, pinning, failure reasons)"
+# Several things remain invisible to a dry run and need unit-style driving of
+# the extracted routing functions with stubbed `ip`/`getent` (bash functions
+# shadow PATH binaries):
+#   * an IPv6 default's OWN device — this machine has no v6 default, so the
+#     plan can never show a /128 and only the function itself can prove the
+#     selection;
+#   * the reason a failed routing step leaves behind — the readiness loop's
+#     message is deliberately terse because that is what the panel can show,
+#     so the kernel's own explanation must land in helper.log;
+#   * the routes FILE the server /32s are recorded in and how teardown reads
+#     it back (the plan shows commands, never the teardown state's contents);
+#   * pin_server_address and bind_direct_outbound — both rewrite the built
+#     config between the jq transform and start_engine, so nothing but a
+#     direct call can prove them.
+{ sed -n '/^route_field_after()/,/^start_engine()/p' "$HELPER" | head -n -1
+  sed -n '/^pin_server_address()/,/^route_field_after()/p' "$HELPER" | head -n -1
+  sed -n '/^helper_log()/,/^}/p' "$HELPER"; } >"$WORK/routing-funcs.sh"
+cat >"$WORK/routing-unit.sh" <<'SH'
+set -uo pipefail
+source "$1"
+
+RUN_DIR="$2"
+HELPER_LOG="$RUN_DIR/helper.log"
+IFACE="omarchy-tun"
+CONFIG_FILE="$RUN_DIR/config.json"
+ROUTES_FILE="$RUN_DIR/routes"
+UPLINK_DEV="" UPLINK_GW="" UPLINK_DEV6="" UPLINK_GW6=""
+unset OMARCHY_V2RAY_TUN_DRY_RUN   # the suite exports 1; helper_log must log
+INVOKER_UID="$(id -u)" INVOKER_GID="$(id -g)" PROFILE_ID="tun-test"
+IPV6_STUB=no
+IP_LOG="$RUN_DIR/ip.args"
+: >"$IP_LOG"
+
+# Only the shapes these scenarios call. The case key is `family + object`:
+# `ip -4 route show default` and `ip -4 route get X` both start `-4 route`,
+# and route_dev_for must NOT answer from the default-route stub.
+ip() {
+  case "$1 $2 $3" in
+    "-4 route get") return 2 ;;
+    "-4 route show") printf '%s\n' 'default via 10.0.0.1 dev uplink0 metric 100' ;;
+    "-6 route get") return 2 ;;
+    "-6 route show")
+      if [[ $IPV6_STUB == yes ]]; then
+        printf '%s\n' 'default via fe80::1 dev wlp2s0 metric 600' \
+                       'default via fe80::2 dev enp0s31f6 metric 100'
+      fi ;;
+    "addr replace "*)
+      printf 'RTNETLINK answers: Operation not permitted\n' >&2; return 2 ;;
+    *)
+      # Every mutation is recorded, so the assertions can check the exact argv
+      # (a replace with via+dev, a delete of a recorded prefix).
+      printf '%s\n' "$*" >>"$IP_LOG"
+      return 0 ;;
+  esac
+}
+
+# The resolver answers only the pin scenarios' names, and only over v4 — the
+# v6 fallback (AAAA when no A exists) has its own scenario below.
+getent() {
+  if [[ ${1:-} == ahostsv4 && ${2:-} == srv.example.test ]]; then
+    printf '%s\n' '203.0.113.99     0  srv.example.test'
+    return 0
+  fi
+  return 2
+}
+
+# A: the IPv6 default's own device is captured and the lowest metric wins,
+#    whatever stale values the caller carried in.
+IPV6_STUB=yes
+IPV6_ENABLED=stale UPLINK_DEV6=stale-iface UPLINK_GW6=2001:db8::dead
+detect_uplink6
+printf 'A dev6=%s gw6=%s ipv6=%s\n' "$UPLINK_DEV6" "$UPLINK_GW6" "$IPV6_ENABLED"
+
+# B: with no v6 default at all, the reset must clear everything — a later call
+#    on the same process must not keep v6 enabled on stale state.
+IPV6_STUB=no
+IPV6_ENABLED=true UPLINK_DEV6=wlp2s0 UPLINK_GW6=fe80::1
+detect_uplink6
+printf 'B dev6=%s gw6=%s ipv6=%s\n' "$UPLINK_DEV6" "$UPLINK_GW6" "$IPV6_ENABLED"
+
+# C: a failing mutation fails the whole apply AND names the kernel's reason.
+#    add_server_routes reads the config itself, so the server address lives in
+#    a config file, not in a manual server_ip_list call. apply_routes no
+#    longer detects the uplink itself (cmd_up does, before the config is
+#    finalised), so the driver performs the same one detect here.
+jq -n '{outbounds:[{tag:"proxy",settings:{vnext:[{address:"203.0.113.10"}]}}]}' \
+  >"$CONFIG_FILE"
+detect_uplink
+if apply_routes; then
+  printf 'C apply_routes unexpectedly succeeded\n'
+else
+  printf 'C apply_routes failed as intended\n'
+fi
+# The recorded route is the FULL prefix — teardown deletes exactly what it
+# reads, not a re-derivation. (Scenario D truncates the file again, so this
+# check must run on C's state, before D.)
+printf 'C routes:\n'; cat "$ROUTES_FILE"
+
+# D: a v6-literal server on a host with no v6 default is refused too — the
+#    tunnel could never dial its own server. The v6 address replaces the v4
+#    one in the config: add_server_routes reads only from there.
+jq -n '{outbounds:[{tag:"proxy",settings:{vnext:[{address:"2001:db8::1234"}]}}]}' \
+  >"$CONFIG_FILE"
+if apply_routes; then
+  printf 'D apply_routes unexpectedly succeeded\n'
+else
+  printf 'D apply_routes failed as intended\n'
+fi
+
+# H: bind_direct_outbound. Only the freedom outbound gains the socket binding;
+#    a non-freedom outbound is left untouched; a missing streamSettings and a
+#    missing sockopt are both CREATED; mode and owner survive the rewrite; an
+#    empty UPLINK_DEV rewrites nothing.
+printf '%s' '{"inbounds":[],"outbounds":[{"tag":"proxy","protocol":"vless","settings":{}},{"tag":"direct","protocol":"freedom"}]}' \
+  >"$CONFIG_FILE"
+UPLINK_DEV=uplink0
+bind_direct_outbound && printf 'H bind ok\n' || printf 'H bind failed\n'
+printf 'H bound=%s untouched=%s mode=%s owner=%s\n' \
+  "$(jq -r '.outbounds[] | select(.protocol == "freedom") | .streamSettings.sockopt.interface' "$CONFIG_FILE")" \
+  "$(jq -r '.outbounds[] | select(.protocol == "vless") | has("streamSettings")' "$CONFIG_FILE")" \
+  "$(stat -c '%a' "$CONFIG_FILE")" \
+  "$(stat -c '%u:%g' "$CONFIG_FILE")"
+
+# An existing sockopt keeps its other keys and only gains the interface.
+printf '%s' '{"inbounds":[],"outbounds":[{"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"mark":42}}}]}' \
+  >"$CONFIG_FILE"
+bind_direct_outbound && printf 'H2 bind ok\n' || printf 'H2 bind failed\n'
+printf 'H2 sockopt=%s\n' \
+  "$(jq -c '.outbounds[0].streamSettings.sockopt' "$CONFIG_FILE")"
+
+# H3: without an uplink there is nothing to bind to — the rewrite must not
+#     happen at all.
+UPLINK_DEV=""
+cp "$CONFIG_FILE" "$RUN_DIR/h3-before.json"
+bind_direct_outbound; h_rc=$?
+if (( h_rc != 0 )); then
+  printf 'H3 bind without an uplink failed as intended\n'
+else
+  printf 'H3 bind without an uplink unexpectedly succeeded\n'
+fi
+if cmp -s "$RUN_DIR/h3-before.json" "$CONFIG_FILE"; then
+  printf 'H3 config untouched\n'
+else
+  printf 'H3 config CHANGED\n'
+fi
+UPLINK_DEV=uplink0
+
+# F: teardown deletes exactly the recorded prefixes — full prefixes as they
+#    stand — and a bare address left by an older build still gets its host-route
+#    niceness, because deleting the bare address deletes nothing.
+printf '4 203.0.113.10/32\n4 10.0.0.0/8\n6 2001:db8::9/128\n4 203.0.113.77\n' >"$ROUTES_FILE"
+remove_server_routes
+# The del argv land in the same log the replaces did; printing it here is what
+# lets the suite assert the exact teardown commands.
+printf 'F ip.args:\n'; cat "$IP_LOG"
+printf 'F routes-file-gone=%s\n' "$([[ -e $ROUTES_FILE ]] && echo no || echo yes)"
+
+# G: pin_server_address. A literal address is left byte-identical; a hostname
+#    is resolved ONCE and rewritten — only the proxy outbound, SNI untouched —
+#    into a 0600 config owned by the invoking user; an unresolvable name fails
+#    with a reason and touches nothing. Every fixture carries `inbounds`, so
+#    the post-rewrite validity check (the same one build_tun_config applies)
+#    passes for the rewritten file.
+printf '%s' '{"inbounds":[],"outbounds":[{"tag":"proxy","settings":{"vnext":[{"address":"203.0.113.10"}]}}]}' \
+  >"$CONFIG_FILE"
+cp "$CONFIG_FILE" "$RUN_DIR/pin-before.json"
+pin_server_address && printf 'G1 pin literal ok\n' || printf 'G1 pin literal failed\n'
+if cmp -s "$RUN_DIR/pin-before.json" "$CONFIG_FILE"; then
+  printf 'G1 literal untouched\n'
+else
+  printf 'G1 literal CHANGED\n'
+fi
+
+printf '%s' '{"inbounds":[],"outbounds":[{"tag":"proxy","protocol":"vless","streamSettings":{"reality":{"serverName":"sn.example.test"}},"settings":{"vnext":[{"address":"srv.example.test","port":443}]}}]}' \
+  >"$CONFIG_FILE"
+pin_server_address && printf 'G2 pin hostname ok\n' || printf 'G2 pin hostname failed\n'
+printf 'G2 address=%s sni=%s mode=%s owner=%s\n' \
+  "$(jq -r '.outbounds[0].settings.vnext[0].address' "$CONFIG_FILE")" \
+  "$(jq -r '.outbounds[0].streamSettings.reality.serverName' "$CONFIG_FILE")" \
+  "$(stat -c '%a' "$CONFIG_FILE")" \
+  "$(stat -c '%u:%g' "$CONFIG_FILE")"
+
+printf '%s' '{"inbounds":[],"outbounds":[{"tag":"proxy","settings":{"vnext":[{"address":"gone.example.test"}]}}]}' \
+  >"$CONFIG_FILE"
+cp "$CONFIG_FILE" "$RUN_DIR/pin-gone-before.json"
+if pin_server_address; then
+  printf 'G3 pin unresolvable unexpectedly succeeded\n'
+else
+  printf 'G3 pin unresolvable failed as intended\n'
+fi
+if cmp -s "$RUN_DIR/pin-gone-before.json" "$CONFIG_FILE"; then
+  printf 'G3 config untouched\n'
+else
+  printf 'G3 config CHANGED\n'
+fi
+SH
+mkdir -p "$WORK/route-run"
+drv="$(bash "$WORK/routing-unit.sh" "$WORK/routing-funcs.sh" "$WORK/route-run" 2>&1)"
+check_not_contains "the unit driver produced no unexpected success" "$drv" \
+  "unexpectedly succeeded"
+check_not_contains "the unit driver is free of shell errors" "$drv" "syntax error"
+check_not_contains "the unit driver touched no unset variable" "$drv" \
+  "unbound variable"
+check_contains "the v6 uplink device is captured and the lowest metric wins" "$drv" \
+  "A dev6=enp0s31f6 gw6=fe80::2 ipv6=true"
+check_contains "a vanished v6 default resets the enable flag and the device" "$drv" \
+  "B dev6= gw6= ipv6=false"
+check_contains "a failing routing mutation fails apply_routes" "$drv" \
+  "C apply_routes failed as intended"
+check "the failed step's kernel reason is in helper.log" \
+  grep -q 'ip addr replace failed: RTNETLINK answers: Operation not permitted' \
+    "$WORK/route-run/helper.log"
+check_contains "the v6-literal refusal fails apply_routes" "$drv" \
+  "D apply_routes failed as intended"
+check "a v6 server IP with no v6 uplink is refused with a reason" \
+  grep -q 'no IPv6 default route; the server address 2001:db8::1234 could not be reached' \
+    "$WORK/route-run/helper.log"
+
+# C/F/H: the server /32 is recorded as a full prefix and torn down from the
+# file; the direct outbound gains its socket binding, nothing else is touched;
+# teardown deletes exactly what was recorded.
+check_contains "the server /32 is recorded as a full prefix" "$drv" \
+  "
+4 203.0.113.10/32"
+check_contains "the server's replace went through the detected uplink" "$drv" \
+  "-4 route replace 203.0.113.10/32 via 10.0.0.1 dev uplink0"
+check_contains "only the freedom outbound gains the socket binding" "$drv" \
+  "H bound=uplink0 untouched=false"
+check_contains "the bound config keeps its mode and owner" "$drv" \
+  "mode=600 owner=$(id -u):$(id -g)"
+check_contains "a sockopt that already exists keeps its other keys" "$drv" \
+  'H2 sockopt={"mark":42,"interface":"uplink0"}'
+check_contains "a bind without an uplink fails the start" "$drv" \
+  "H3 bind without an uplink failed as intended"
+check_contains "the failed bind rewrote nothing" "$drv" \
+  "H3 config untouched"
+check_not_contains "no direct-pinning leftovers in the driver" "$drv" \
+  "unexpectedly succeeded"
+check_contains "teardown deletes recorded prefixes as they stand" "$drv" \
+  "-4 route del 10.0.0.0/8"
+check_contains "teardown keeps the host-route niceness for a v6 entry" "$drv" \
+  "-6 route del 2001:db8::9/128"
+check_contains "a bare address from an older build is torn down as a /32" "$drv" \
+  "-4 route del 203.0.113.77/32"
+check "the routes file is removed once teardown has read it" \
+  grep -q 'F routes-file-gone=yes' <<<"$drv"
+
+# G: the pin. The dial target and the /32 must be the same literal, resolved
+# while the system's own resolvers still answer.
+check_contains "pin_server_address leaves an IP literal untouched" "$drv" \
+  "G1 literal untouched"
+check_contains "a hostname is resolved once and rewritten, SNI and mode kept" "$drv" \
+  "G2 address=203.0.113.99 sni=sn.example.test mode=600 owner=$(id -u):$(id -g)"
+check_contains "an unresolvable server name fails the pin without touching the config" \
+  "$drv" "G3 config untouched"
+check_contains "the unresolvable name fails the start as intended" "$drv" \
+  "G3 pin unresolvable failed as intended"
+check "the pin refusal names the name it could not resolve" \
+  grep -q 'pin: nothing usable resolved for gone.example.test' \
+    "$WORK/route-run/helper.log"
+check "the pin records the hostname and the address it chose" \
+  grep -q 'server address srv.example.test -> 203.0.113.99' \
+    "$WORK/route-run/helper.log"
 
 # =============================================================================
 echo
@@ -333,8 +694,13 @@ else
 fi
 
 if [[ $stand_in_ok == true ]]; then
+  # The iface cannot exist ("abs" keeps it 15 chars — within the kernel's
+  # IFNAMSIZ that read_state_iface accepts — and the name matches no device
+  # on this or any host): the route deletions in plan_down are gated on
+  # /sys/class/net/$iface, and the assertions below must not depend on
+  # whether this particular host happens to have a live tunnel running.
   jq -n --arg pid "$FAKE_PID" --argjson since "$(date +%s)" \
-    '{profileId:"tun-test", iface:"omarchy-tun", pid:$pid, since:$since}' >"$RUN/state.json"
+    '{profileId:"tun-test", iface:"omarchy-tun-abs", pid:$pid, since:$since}' >"$RUN/state.json"
   # The presence of a resolv.conf backup is what tells `down` that the file mode
   # was used (the state shape is fixed and has no room for a DNS-mode field).
   printf 'nameserver 192.0.2.53\n' >"$RUN/resolv.conf.orig"
@@ -348,9 +714,9 @@ if [[ $stand_in_ok == true ]]; then
   check_contains "down removes the state file" "$flat" "$RUN/state.json"
   check "the dry-run down did NOT actually kill the stand-in" test -d "/proc/$FAKE_PID"
 
-  # The route deletions are conditional on the link existing: a tun's routes are
-  # removed with the device. This test has no real interface, so the plan
-  # intentionally contains no `ip route del`.
+  # The route deletions are conditional on the link existing: a tun's routes
+  # are removed with the device. The fixture's iface name matches no real
+  # device, so the plan intentionally contains no bare `ip route del`.
   out="$("$HELPER" down 2>/dev/null)"
   flat="$(jq -r '.commands | join("\n")' <<<"$out")"
   check "the with-state plan is non-empty" jq -e '(.commands | length) > 0' <<<"$out"

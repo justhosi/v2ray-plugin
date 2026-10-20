@@ -75,7 +75,9 @@
 #   tun-up <id>         Start the system-wide TUN tunnel through pkexec.
 #                       Returns at once; the polkit prompt must not block the
 #                       panel (see cmd_tun_up).
-#   tun-down            Stop it (also through pkexec; idempotent).
+#   tun-down            Stop it: signal the user-owned engine directly (no
+#                       password) and wait for the root supervisor's cleanup;
+#                       pkexec is only the fallback. Idempotent.
 #   tun-toggle <id>     Down when active, otherwise up.
 #   list                Every imported profile as a JSON array.
 #   import              Read {id,meta,config} JSON on STDIN, write a profile.
@@ -993,6 +995,12 @@ cmd_tun_down() {
   #     stale file's word alone;
   #   * wait ~5s for the state file to disappear, which is how the supervisor
   #     signals completion;
+  #   * if the state file is STILL there because the engine ignored SIGTERM —
+  #     the supervisor's own teardown spends that same 5s before its SIGKILL
+  #     and then still has DNS and routes to restore, so a hung engine would
+  #     otherwise reliably fall through to a password prompt — escalate to
+  #     SIGKILL from this same uid (no privilege needed) and wait ~3s more for
+  #     the supervisor to finish;
   #   * on disappearance, the tunnel is off — report `stopped` with no pkexec
   #     at all. On anything else (no state file, dead pid, a supervisor that
   #     died before cleanup, a pid that is not an engine) the privileged
@@ -1014,6 +1022,22 @@ cmd_tun_down() {
       if [[ ! -f $TUN_STATE_FILE ]]; then
         jq -n '{ok:true, stopped:true}'
         exit 0
+      fi
+      # Escalate only on positive identification AGAIN: a supervisor that
+      # already SIGKILLed the engine leaves a pid slot a new process could
+      # occupy within these seconds, and comm is the one thing a recycled pid
+      # cannot fake into looking like the engine we were told about.
+      if [[ -d /proc/$pid ]] \
+         && [[ "$(cat -- "/proc/$pid/comm" 2>/dev/null)" == "xray" ]]; then
+        kill -KILL "$pid" 2>/dev/null || true
+        for i in $(seq 1 15); do
+          [[ -f $TUN_STATE_FILE ]] || break
+          sleep 0.2
+        done
+        if [[ ! -f $TUN_STATE_FILE ]]; then
+          jq -n '{ok:true, stopped:true}'
+          exit 0
+        fi
       fi
     fi
   fi

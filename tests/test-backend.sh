@@ -857,6 +857,54 @@ if cp /usr/bin/sleep "$WORK/xray" && chmod +x "$WORK/xray"; then
 fi
 [[ -n $xray_pid ]] && kill "$xray_pid" 2>/dev/null || true
 
+# ============================================================================= ====
+# The HUNG-engine escalation: an engine that ignores SIGTERM must still stop
+# prompt-free. The stand-in is a binary copy of bash named `xray` running
+# `trap "" TERM` — its /proc/<pid>/comm is exactly "xray" and it refuses to die
+# politely, which is the only shape a userspace test can give a hung engine.
+# The backend must spend its ~5s TERM wait, re-identify the pid by comm, then
+# SIGKILL it with the same uid — no pkexec anywhere. The lower bound on the
+# elapsed time is the proof the TERM wait was actually spent: sleep 0.2 never
+# overshoots DOWNward, so 25 rounds are never less than 5s.
+if cp /bin/bash "$WORK/xray" 2>/dev/null && chmod +x "$WORK/xray"; then
+  "$WORK/xray" -c 'trap "" TERM; while :; do sleep 0.2; done' & xray_pid=$!
+  sleep 0.1
+  if [[ "$(cat "/proc/$xray_pid/comm" 2>/dev/null)" == "xray" ]]; then
+    jq -n --arg pid "$xray_pid" \
+      '{profileId:"tun-test", iface:"omarchy-tun", pid:$pid, since:1700000000}' >"$TUN_STATE"
+    ( while [[ -n "$(cat -- "/proc/$xray_pid/comm" 2>/dev/null)" ]]; do sleep 0.1; done
+      rm -f -- "$TUN_STATE" ) & watcher_pid=$!
+    rm -f "$WORK/pkexec.args"
+    SECONDS=0
+    out="$(PKEXEC_ARGS="$WORK/pkexec.args" PATH="$PKEBIN:$PATH" \
+      OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" \
+      OMARCHY_V2RAY_TUN_HELPER="$WORK/never-installed-helper" \
+      "$BACKEND" tun-down 2>/dev/null)"; down_rc=$?
+    hung_elapsed=$SECONDS
+    check "a TERM-ignoring engine is stopped via the same-uid SIGKILL" \
+      test "$down_rc" -eq 0
+    check "the escalation still reports stopped, without a launch" \
+      jq -e '.ok == true and .stopped == true and (has("launched") | not)' <<<"$out"
+    # Reap so no zombie /proc entry survives the assertion.
+    wait "$xray_pid" 2>/dev/null
+    check "the hung stand-in is gone" \
+      test ! -d "/proc/$xray_pid"
+    check "the ~5s TERM wait was spent before the escalation" \
+      test "$hung_elapsed" -ge 5
+    check "the modelled supervisor's cleanup was awaited" \
+      test ! -e "$TUN_STATE"
+    check "the escalation never reached pkexec" \
+      test ! -e "$WORK/pkexec.args"
+    wait "$watcher_pid" 2>/dev/null
+    xray_pid=""
+  else
+    printf '  SKIP the hung-engine escalation (the stand-in does not report comm=xray)\n'
+    kill -KILL "$xray_pid" 2>/dev/null || true
+    xray_pid=""
+  fi
+fi
+[[ -n $xray_pid ]] && kill -KILL "$xray_pid" 2>/dev/null || true
+
 # =============================================================================
 echo
 echo "case 1: the server refuses the REALITY handshake"

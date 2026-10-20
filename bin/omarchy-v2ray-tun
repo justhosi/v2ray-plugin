@@ -78,9 +78,13 @@
 #   * the only elevated capability is CAP_NET_ADMIN, so a swapped config can do
 #     exactly what net_admin can do — create/rename links, add routes — and
 #     nothing else (no file access, no process control, no root shell);
-#   * the helper never reads the config back, so a swapped file cannot change
-#     what the helper later tears down (the iface, DNS and pid are recorded in
-#     the state file by us, not taken from the config).
+#   * the helper never reads the config back TO DECIDE WHAT TO TEAR DOWN —
+#     teardown uses the recorded `routes` file and the state file (iface, DNS,
+#     pid), not the config. The one later read, apply_routes extracting the
+#     server's address for its /32 and /128 exemptions, passes the value
+#     through the same validation as profile-derived text before it reaches
+#     `ip`; a swapped file can only steer routing for an engine the user
+#     already controls.
 #
 # The alternative — a config the user cannot write — is impossible while the
 # engine runs as the user. The file is therefore deleted as soon as the engine
@@ -147,9 +151,14 @@ LAST_ERROR="$RUN_DIR/last-error"
 LOCK_FILE="$RUN_DIR/lock"
 RESOLV_BAK="$RUN_DIR/resolv.conf.orig"
 RESOLV_NEW="$RUN_DIR/resolv.conf.new"
-# Every host route the helper installed (one "family address" pair per line).
-# Teardown reads THIS file back instead of re-deriving the server's address, so
-# `down` deletes exactly what `up` put in and nothing else.
+# Every host route the helper installed — the server's /32 and /128
+# exemptions — one "family prefix" pair per line (e.g. `4 203.0.113.10/32`),
+# always the FULL prefix so teardown can delete exactly what it sees. The
+# direct outbound is NOT routed this way any more: its sockets are bound to
+# the uplink (see bind_direct_outbound), so the helper never claims a range
+# the kernel may already serve by a route that matters. Teardown reads THIS
+# file back instead of re-deriving what was routed, so `down` deletes exactly
+# what `up` put in and nothing else.
 ROUTES_FILE="$RUN_DIR/routes"
 
 # The tun interface name is chosen by US, not by the caller. It reaches `ip` and
@@ -197,6 +206,10 @@ ENGINE_ALLOWLIST=(
 # therefore installed by THIS helper (see apply_routes); the keys stay in the
 # engine config because a future xray may honour them, and `ip route/addr
 # replace` makes the two installs idempotent against each other.
+#
+# BECAUSE autoOutboundsInterface IS IGNORED, the `direct` (freedom) outbound
+# cannot rely on it to stay off the tun either: its sockets are bound to the
+# uplink explicitly (sockopt.interface, see bind_direct_outbound).
 TUN_INBOUND_JQ='.inbounds = (((.inbounds // []) | map(select(.protocol != "tun"))) + [{tag:"tun-in",protocol:"tun",settings:{name:$iface,mtu:1500,gateway:["10.66.0.1/16","fc00:66::1/64"],autoSystemRoutingTable:["0.0.0.0/1","128.0.0.0/1","::/1","8000::/1"],autoOutboundsInterface:"auto"}}])'
 
 # Set once the engine is our child; used by every teardown path.
@@ -210,9 +223,13 @@ CONFIG_GUARD=0
 
 # The physical uplink, resolved by detect_uplink the moment routes are applied.
 # Empty until then (and empty again on every later process: `down` never needs
-# them, because it deletes what the ROUTES_FILE records).
+# them, because it deletes what the ROUTES_FILE records). The 6-suffixed pair
+# is the IPv6 default's own gateway AND device: on a split-interface dual-stack
+# host they do not have to match the v4 pair, and pairing a v6 gateway with the
+# v4 device is exactly the error the /128 route would then hit.
 UPLINK_DEV=""
 UPLINK_GW=""
+UPLINK_DEV6=""
 UPLINK_GW6=""
 # IPv6 in the tunnel only when the machine actually has an IPv6 default route;
 # flipping it on for a v4-only host would install routes the kernel cannot use.
@@ -695,6 +712,128 @@ build_tun_config() {
   mv -f -- "$tmp" "$CONFIG_FILE" || { rm -f -- "$tmp"; refuse "could not publish the config"; }
 }
 
+pin_server_address() {
+  # RESOLVE ONCE, THEN PIN. The config keeps the profile's HOSTNAME and xray
+  # re-resolves at dial time under domainStrategy "AsIs" — by then apply_dns has
+  # pointed DNS INTO the tunnel, so a rotating (or simply uncached) answer can
+  # name an address whose /32 exemption was never installed, and the engine's
+  # own dial goes back into the tun it fills. Resolving BEFORE the engine
+  # starts — while the system's own resolvers still answer — and REWRITING the
+  # proxy outbound's address to that literal is what makes the /32 exemption
+  # cover every dial: after this the dial target is an address, and AsIs never
+  # re-resolves one.
+  #
+  # v4 FIRST, always: the /32 exemption is the address that gets pinned, and a
+  # machine with any v4 uplink can reach the server through it. The AAAA
+  # fallback exists only for a name with no A record on a host that HAS an IPv6
+  # default route (there UPLINK_DEV6 exists and the /128 is pinned). Untouched:
+  # SNI/serverName — the engine still presents the profile's certificate name;
+  # only the dial target changes.
+  #
+  # Same rewrite discipline as build_tun_config: temp file 0600 in the root-owned
+  # run directory, chowned to the invoking user, renamed into place. The config
+  # is never logged; the HOSTNAME (not a secret) and the pinned address are.
+  local addr host ip4="" ip6="" picked="" tmp
+  addr="$(server_address_from_file "$CONFIG_FILE")"
+  [[ -n $addr ]] || { helper_log "pin: the config has no usable proxy address"; return 1; }
+  if [[ $addr =~ ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})$ ]] \
+     || { [[ $addr == *:* ]] && [[ $addr =~ ^[0-9A-Fa-f:.]{2,45}$ ]]; }; then
+    return 0
+  fi
+  host="$addr"
+  # Only an ordinary hostname shape reaches getent: getent has no `--` guard,
+  # so a value with a leading dash would reach its option parser. Colons are
+  # already gone (they are the literal branch above).
+  [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$ ]] \
+    || { helper_log "pin: $host is not a shape that can be resolved"; return 1; }
+
+  # Read-only, and idempotent with the later apply_routes call; needed here for
+  # the AAAA fallback's one condition (a v6 default route).
+  detect_uplink6
+  ip4="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | head -n 1)"
+  if [[ $ip4 =~ ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})$ ]]; then
+    picked="$ip4"
+  elif [[ $IPV6_ENABLED == true ]]; then
+    ip6="$(getent ahostsv6 "$host" 2>/dev/null | awk '{print $1}' | head -n 1)"
+    [[ $ip6 =~ ^[0-9A-Fa-f:.]{2,45}$ ]] && picked="$ip6"
+  fi
+  [[ -n $picked ]] \
+    || { helper_log "pin: nothing usable resolved for $host (no A record, or no AAAA and no IPv6 default route)"; return 1; }
+
+  tmp="$RUN_DIR/.config.json.$$"
+  jq --arg ip "$picked" '
+      (.outbounds // []) |= map(
+        if (.tag // "") == "proxy"
+        then
+          .settings.vnext = ((.settings.vnext // []) | if length > 0 then (.[0].address = $ip) else . end)
+          | .settings.servers = ((.settings.servers // []) | if length > 0 then (.[0].address = $ip) else . end)
+        else . end)' \
+    "$CONFIG_FILE" >"$tmp" 2>/dev/null \
+    || { rm -f -- "$tmp"; helper_log "pin: rewriting $host to $picked failed"; return 1; }
+  [[ -s $tmp ]] || { rm -f -- "$tmp"; helper_log "pin: rewriting $host produced an empty config"; return 1; }
+  jq -e '.inbounds | type == "array"' "$tmp" >/dev/null 2>&1 \
+    || { rm -f -- "$tmp"; helper_log "pin: rewriting $host produced an invalid config"; return 1; }
+  chown "$INVOKER_UID:$INVOKER_GID" -- "$tmp" 2>/dev/null \
+    || { rm -f -- "$tmp"; helper_log "pin: could not hand the config to the invoking user"; return 1; }
+  chmod 0600 -- "$tmp" || { rm -f -- "$tmp"; helper_log "pin: could not protect the config"; return 1; }
+  mv -f -- "$tmp" "$CONFIG_FILE" \
+    || { rm -f -- "$tmp"; helper_log "pin: could not publish the pinned config"; return 1; }
+  helper_log "pin: profile $PROFILE_ID server address $host -> $picked"
+}
+
+bind_direct_outbound() {
+  # KEEP THE DIRECT OUTBOUND OFF THE TUN AT THE SOCKET LEVEL. The `direct`
+  # (freedom) outbound is what answers the `direct` routing rule — LAN, printer,
+  # anything the profile refuses to tunnel — but xray's own
+  # autoOutboundsInterface key is one of the keys this build IGNORES on Linux
+  # (see TUN_INBOUND_JQ's measured corollary), so without this a direct dial
+  # opens a socket that the /1+/ /1 pairs steer straight back into the tun it
+  # was supposed to bypass: a loop bounded only by timeouts. Binding the socket
+  # to the physical uplink (sockopt.interface, documented xray behaviour) keeps
+  # the dial on the link and touches NO routing table — which is also why this
+  # replaces the previous direct-range route pinning: pinned CIDRs could
+  # override a route that matters (a VPN split tunnel, a bridge, a container
+  # network), and teardown would then delete a route the helper did not
+  # create.
+  #
+  # DOCUMENTED LIMITATION: on a split-interface dual-stack host this pins IPv6
+  # direct traffic to the IPv4 uplink's device too. A direct dial that needed
+  # the v6 uplink's own device still leaves the machine — the device exists —
+  # just through a different link than a per-family bind would pick.
+  #
+  # Same rewrite discipline as build_tun_config / pin_server_address: temp file
+  # in $RUN_DIR, 0600 from the first byte, chowned to the invoking user,
+  # renamed into place. streamSettings and sockopt are CREATED when absent; an
+  # existing sockopt keeps its other keys (mark, and so on) and only gains the
+  # interface. cmd_up detects the uplink before calling this; the guard is
+  # what refuses a start that somehow reached here without one, rather than
+  # binding the sockets to an empty interface name.
+  [[ -n $UPLINK_DEV ]] \
+    || { helper_log "bind: no uplink was detected before the start"; return 1; }
+  local tmp
+  tmp="$RUN_DIR/.config.json.$$"
+  jq --arg iface "$UPLINK_DEV" '
+      (.outbounds // []) |= map(
+        if (.protocol // "") == "freedom"
+        then
+          .streamSettings = ((.streamSettings // {})
+            + {sockopt: ((.streamSettings.sockopt // {}) + {interface: $iface})})
+        else . end)' \
+    "$CONFIG_FILE" >"$tmp" 2>/dev/null \
+    || { rm -f -- "$tmp"; helper_log "bind: rewriting the direct outbound failed"; return 1; }
+  [[ -s $tmp ]] \
+    || { rm -f -- "$tmp"; helper_log "bind: rewriting produced an empty config"; return 1; }
+  jq -e '.inbounds | type == "array"' "$tmp" >/dev/null 2>&1 \
+    || { rm -f -- "$tmp"; helper_log "bind: rewriting produced an invalid config"; return 1; }
+  chown "$INVOKER_UID:$INVOKER_GID" -- "$tmp" 2>/dev/null \
+    || { rm -f -- "$tmp"; helper_log "bind: could not hand the config to the invoking user"; return 1; }
+  chmod 0600 -- "$tmp" \
+    || { rm -f -- "$tmp"; helper_log "bind: could not protect the config"; return 1; }
+  mv -f -- "$tmp" "$CONFIG_FILE" \
+    || { rm -f -- "$tmp"; helper_log "bind: could not publish the bound config"; return 1; }
+  helper_log "bind: the direct outbound's sockets are bound to $UPLINK_DEV"
+}
+
 detect_dns_mode() {
   # Prefer systemd-resolved: it can attach resolvers to ONE link, so the rest of
   # the system keeps working and `resolvectl revert` restores the old state
@@ -825,7 +964,10 @@ server_ip_list() {
   local host="${1:-}" ip
   SERVER_IPS4=()
   SERVER_IPS6=()
-  [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$ ]] || return 0
+  # Colons belong in the shape: a v6 literal is shaped like one, and without
+  # them here the branch below was unreachable for literals (an all-hex,
+  # colon-less address is not a valid v6 either).
+  [[ $host =~ ^[A-Za-z0-9:.][A-Za-z0-9:._-]{0,252}$ ]] || return 0
 
   # An IPv4 literal needs no lookup — and a made-up one (999.999.999.999) is
   # dropped here instead of feeding the kernel something it will reject.
@@ -885,18 +1027,34 @@ detect_uplink() {
 }
 
 detect_uplink6() {
-  # UPLINK_GW6 is set only when an IPv6 default route actually exists, and that
-  # existence is ALSO what enables the v6 half of the tunnel (address, /1 pair,
-  # server /128s). Deriving it from the LINK instead of hoping the engine's
-  # config keys did something is the same lesson as apply_routes.
+  # UPLINK_GW6/UPLINK_DEV6 are set only when an IPv6 default route actually
+  # exists, and that existence is ALSO what enables the v6 half of the tunnel
+  # (address, /1 pair, server /128s). Deriving it from the LINK instead of
+  # hoping the engine's config keys did something is the same lesson as
+  # apply_routes. THE DEVICE IS CAPTURED TOO: a /128 needs the v6 default's own
+  # link — pairing the v6 gateway with the v4 device would be correct only by
+  # coincidence and EINVAL or an on-link /128 on the wrong NIC on a host whose
+  # two stacks leave through different interfaces.
   UPLINK_GW6=""
-  local line gw
+  UPLINK_DEV6=""
+  # Reset before scanning, so a repeat call cannot keep v6 enabled on the word
+  # of a default route that has since vanished.
+  IPV6_ENABLED=false
+  local line dev gw metric best_metric=""
   while IFS= read -r line; do
     [[ $line == default* ]] || continue
-    IPV6_ENABLED=true
+    dev="$(route_field_after "$line" dev)"
     gw="$(route_field_after "$line" via)"
-    [[ $gw =~ ^[0-9A-Fa-f:.]+$ ]] && UPLINK_GW6="$gw"
-    return 0
+    metric="$(route_field_after "$line" metric)"
+    [[ $dev =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$ ]] || continue
+    [[ $metric =~ ^[0123456789]+$ ]] || metric=""
+    metric=$(( 10#${metric:-0} ))
+    if [[ -z $best_metric || $metric -lt $best_metric ]]; then
+      best_metric="$metric"
+      IPV6_ENABLED=true
+      UPLINK_DEV6="$dev"
+      [[ $gw =~ ^[0-9A-Fa-f:.]+$ ]] && UPLINK_GW6="$gw" || UPLINK_GW6=""
+    fi
   done < <(ip -6 route show default 2>/dev/null)
   return 0
 }
@@ -929,7 +1087,7 @@ add_server_routes() {
   # install a copy too, and replace turns a re-run into a no-op instead of an
   # error. Recorded in $ROUTES_FILE line by line, because teardown may run in a
   # process that never detected the uplink (plain `down` after a crash).
-  local file="${1:-$CONFIG_FILE}" addr ip
+  local file="${1:-$CONFIG_FILE}" addr ip out
   declare -a use_via=()
   addr="$(server_address_from_file "$file")"
   [[ -n $addr ]] || return 1
@@ -944,41 +1102,69 @@ add_server_routes() {
   for ip in "${SERVER_IPS4[@]}"; do
     use_via=()
     [[ -n $UPLINK_GW ]] && use_via=(via "$UPLINK_GW")
-    ip -4 route replace "$ip/32" "${use_via[@]}" dev "$UPLINK_DEV" >/dev/null 2>&1 \
-      || { helper_log "routes: ip -4 route replace failed for $ip/32"; return 1; }
-    printf '%s %s\n' 4 "$ip" >>"$ROUTES_FILE" || return 1
+    # stderr is merged into the capture and quoted in helper.log: a bare
+    # "could not route traffic" from the readiness loop is useless without the
+    # kernel's reason, and ip's stderr carries nothing but that reason.
+    out="$(ip -4 route replace "$ip/32" "${use_via[@]}" dev "$UPLINK_DEV" 2>&1)" \
+      || { helper_log "routes: ip -4 route replace failed for $ip/32: ${out:-unknown error}"; return 1; }
+    # The full prefix, so teardown can delete exactly what it reads.
+    printf '%s %s\n' 4 "$ip/32" >>"$ROUTES_FILE" || return 1
   done
   for ip in "${SERVER_IPS6[@]}"; do
+    # THE /128 NEEDS THE V6 DEFAULT'S OWN LINK, not the v4 uplink: on a
+    # split-interface dual-stack host pairing them is EINVAL (or an on-link
+    # /128 on the wrong NIC that the verify would miss). And with no v6
+    # default at all there is no way out for these packets — a v6-literal
+    # server on a v4-only host would start a tunnel that cannot ever dial its
+    # own server, so fail loudly instead of pretending.
+    [[ -n $UPLINK_DEV6 ]] \
+      || { helper_log "routes: no IPv6 default route; the server address $ip could not be reached"; return 1; }
     use_via=()
     [[ -n $UPLINK_GW6 ]] && use_via=(via "$UPLINK_GW6")
-    ip -6 route replace "$ip/128" "${use_via[@]}" dev "$UPLINK_DEV" >/dev/null 2>&1 \
-      || { helper_log "routes: ip -6 route replace failed for $ip/128"; return 1; }
-    printf '%s %s\n' 6 "$ip" >>"$ROUTES_FILE" || return 1
+    out="$(ip -6 route replace "$ip/128" "${use_via[@]}" dev "$UPLINK_DEV6" 2>&1)" \
+      || { helper_log "routes: ip -6 route replace failed for $ip/128: ${out:-unknown error}"; return 1; }
+    printf '%s %s\n' 6 "$ip/128" >>"$ROUTES_FILE" || return 1
   done
 }
 
 apply_routes() {
   # Install the system side, then prove it or fail the start. The order is the
-  # whole point: uplink first (nothing to route through otherwise), the
-  # SERVER's exceptions next (they must outrank the /1s in the kernel's
-  # longest-prefix lookup regardless of when we look), then the tunnel's
-  # address, its link state, and the two /1 pairs that cover the entire
-  # internet without touching the real default route. `replace` everywhere, so
-  # this is idempotent and so a future engine that installs its own routes
-  # never makes a second pass fail.
-  detect_uplink || { helper_log "routes: no default route; the /1 routes would have no way out"; return 1; }
-  detect_uplink6
+  # whole point: the SERVER's exceptions first (they must outrank the /1s in
+  # the kernel's longest-prefix lookup regardless of when we look), then the
+  # tunnel's address, its link state, and the two /1 pairs that cover the
+  # entire internet without touching the real default route. `replace`
+  # everywhere, so this is idempotent and so a future engine that installs its
+  # own routes never makes a second pass fail.
+  #
+  # The uplink was detected BEFORE the engine started (see cmd_up), because
+  # bind_direct_outbound needs the device for the direct outbound's sockets
+  # too — detecting twice would only invite disagreement between the bound
+  # socket and the routes. The globals carry the verdict from here on.
+  [[ -n $UPLINK_DEV ]] \
+    || { helper_log "routes: no uplink was detected before the start"; return 1; }
   add_server_routes "$CONFIG_FILE" \
     || { helper_log "routes: no usable server address for the /32 and /128 exemptions"; return 1; }
 
-  ip addr replace 10.66.0.1/16 dev "$IFACE" 2>/dev/null || return 1
-  ip link set dev "$IFACE" up 2>/dev/null || return 1
-  ip route replace 0.0.0.0/1 dev "$IFACE" 2>/dev/null || return 1
-  ip route replace 128.0.0.0/1 dev "$IFACE" 2>/dev/null || return 1
+  # Every failing step quotes the kernel's reason in helper.log: the readiness
+  # loop can only surface "could not route traffic through $IFACE", so without
+  # this the actual RTNETLINK error would be lost and a failed start would be
+  # undiagnosable. stderr only; these commands print nothing to stdout.
+  local out
+  out="$(ip addr replace 10.66.0.1/16 dev "$IFACE" 2>&1)" \
+    || { helper_log "routes: ip addr replace failed: ${out:-unknown error}"; return 1; }
+  out="$(ip link set dev "$IFACE" up 2>&1)" \
+    || { helper_log "routes: ip link set up failed: ${out:-unknown error}"; return 1; }
+  out="$(ip route replace 0.0.0.0/1 dev "$IFACE" 2>&1)" \
+    || { helper_log "routes: ip route replace 0.0.0.0/1 failed: ${out:-unknown error}"; return 1; }
+  out="$(ip route replace 128.0.0.0/1 dev "$IFACE" 2>&1)" \
+    || { helper_log "routes: ip route replace 128.0.0.0/1 failed: ${out:-unknown error}"; return 1; }
   if [[ $IPV6_ENABLED == true ]]; then
-    ip -6 addr replace fc00:66::1/64 dev "$IFACE" 2>/dev/null || return 1
-    ip -6 route replace ::/1 dev "$IFACE" 2>/dev/null || return 1
-    ip -6 route replace 8000::/1 dev "$IFACE" 2>/dev/null || return 1
+    out="$(ip -6 addr replace fc00:66::1/64 dev "$IFACE" 2>&1)" \
+      || { helper_log "routes: ip -6 addr replace failed: ${out:-unknown error}"; return 1; }
+    out="$(ip -6 route replace ::/1 dev "$IFACE" 2>&1)" \
+      || { helper_log "routes: ip -6 route replace ::/1 failed: ${out:-unknown error}"; return 1; }
+    out="$(ip -6 route replace 8000::/1 dev "$IFACE" 2>&1)" \
+      || { helper_log "routes: ip -6 route replace 8000::/1 failed: ${out:-unknown error}"; return 1; }
   fi
 
   # THE PROOF: the probe must leave through the tunnel, and EVERY server
@@ -987,13 +1173,29 @@ apply_routes() {
   # the panel claim a tunnel traffic is still bypassing. Each mismatch is named
   # in helper.log, because the engine log a failing start quotes will never
   # carry a routing reason.
-  local dev ip
-  if ! dev="$(route_dev_for 4 1.1.1.1)"; then
-    helper_log "routes: verification failed; no route at all for 1.1.1.1"
-    return 1
+  local dev ip probe candidate
+  # THE PROBE MUST NOT BE A SERVER ADDRESS: a profile whose server IS 1.1.1.1
+  # would route its own probe through the uplink and fail its own start. Walk
+  # a fixed candidate list and take the first that is not in the recorded
+  # server list — the space-padded comparison exists so e.g. 101.1.1.1 cannot
+  # match 1.1.1.1 as a substring. The probe is skipped only when every
+  # candidate IS a server address; the per-server checks still prove that no
+  # server path enters the tun, which is the half a wrong probe could fake.
+  probe=""
+  for candidate in 1.1.1.1 8.8.8.8 9.9.9.9; do
+    if [[ " ${SERVER_IPS4[*]-} " != *" $candidate "* ]]; then
+      probe="$candidate"
+      break
+    fi
+  done
+  if [[ -n $probe ]]; then
+    if ! dev="$(route_dev_for 4 "$probe")"; then
+      helper_log "routes: verification failed; no route at all for $probe"
+      return 1
+    fi
+    [[ $dev == "$IFACE" ]] \
+      || { helper_log "routes: verification failed; $probe would not leave through $IFACE"; return 1; }
   fi
-  [[ $dev == "$IFACE" ]] \
-    || { helper_log "routes: verification failed; 1.1.1.1 would not leave through $IFACE"; return 1; }
   for ip in "${SERVER_IPS4[@]}"; do
     if ! dev="$(route_dev_for 4 "$ip")"; then
       helper_log "routes: verification failed; no route at all for $ip"
@@ -1002,16 +1204,29 @@ apply_routes() {
     [[ $dev != "$IFACE" ]] \
       || { helper_log "routes: verification failed; $ip still routes through $IFACE"; return 1; }
   done
-  if [[ $IPV6_ENABLED == true ]]; then
-    for ip in "${SERVER_IPS6[@]}"; do
-      if ! dev="$(route_dev_for 6 "$ip")"; then
+  # IPv6 exceptions: never through the tun, and — when the tunnel carries v6 —
+  # out through the IPv6 default's own link. Plainly "not the tun" was the
+  # weaker check that let an on-link /128 on the WRONG NIC pass unnoticed.
+  for ip in "${SERVER_IPS6[@]}"; do
+    dev="$(route_dev_for 6 "$ip")" || dev=""
+    if [[ $IPV6_ENABLED == true ]]; then
+      if [[ -z $dev ]]; then
         helper_log "routes: verification failed; no route at all for $ip (v6)"
         return 1
       fi
       [[ $dev != "$IFACE" ]] \
         || { helper_log "routes: verification failed; $ip (v6) still routes through $IFACE"; return 1; }
-    done
-  fi
+      if [[ -n $UPLINK_DEV6 && $dev != "$UPLINK_DEV6" ]]; then
+        helper_log "routes: verification failed; $ip (v6) leaves via $dev, not the IPv6 uplink $UPLINK_DEV6"
+        return 1
+      fi
+    elif [[ $dev == "$IFACE" ]]; then
+      # v6 was not installed by us, yet the tun owns the address anyway: a
+      # start must not claim success on top of routing state it did not make.
+      helper_log "routes: verification failed; $ip (v6) routes through $IFACE without our v6 routes"
+      return 1
+    fi
+  done
   return 0
 }
 
@@ -1045,17 +1260,26 @@ remove_server_routes() {
   # and the file is removed afterwards so a crash can never re-apply stale
   # entries.
   [[ -f $ROUTES_FILE ]] || return 0
-  local family ip
-  # READ WITHOUT IFS= — the file is ours ("family address"), so the default
+  local family prefix
+  # READ WITHOUT IFS= — the file is ours ("family prefix"), so the default
   # whitespace split is exactly the parse; a leading-IFS read would put the
   # whole line in $family.
-  while read -r family ip; do
+  while read -r family prefix; do
     [[ $family == 4 || $family == 6 ]] || continue
-    [[ $ip =~ ^[0-9A-Fa-f:.]{1,45}$ ]] || continue
-    if [[ $family == 4 ]]; then
-      ip -4 route del "$ip/32" 2>/dev/null || true
+    if [[ $prefix == */* ]]; then
+      # Full prefix form (what every writer now records).
+      [[ $prefix =~ ^[0-9A-Fa-f:.]{1,45}/[0123456789]{1,3}$ ]] || continue
     else
-      ip -6 route del "$ip/128" 2>/dev/null || true
+      # A bare host address: written by a helper built before the routes file
+      # carried prefixes. Give it the same host-route niceness every writer
+      # now records (/32 or /128), so a stale entry still deletes cleanly.
+      [[ $prefix =~ ^[0-9A-Fa-f:.]{1,45}$ ]] || continue
+      if [[ $family == 4 ]]; then prefix="${prefix}/32"; else prefix="${prefix}/128"; fi
+    fi
+    if [[ $family == 4 ]]; then
+      ip -4 route del "$prefix" 2>/dev/null || true
+    else
+      ip -6 route del "$prefix" 2>/dev/null || true
     fi
   done <"$ROUTES_FILE"
   rm -f -- "$ROUTES_FILE"
@@ -1220,6 +1444,63 @@ plan_up() {
   dry_cmd chmod 0600 -- "$plan_tmp"
   dry_cmd mv -f -- "$plan_tmp" "$CONFIG_FILE"
 
+  # Uplink detection probes the live machine and is read-only, like
+  # detect_dns_mode above; it must run BEFORE the pin mirror (the AAAA fallback
+  # needs the v6 default's verdict) and before the routes below reuse it.
+  local plan_addr pin_ip="" ip use_via4=() use_via6=()
+  detect_uplink
+  detect_uplink6
+
+  # Mirror pin_server_address: the engine must dial the literal the /32
+  # exemption names, and the only moment both are the same resolution is when
+  # the address is pinned BEFORE the tunnel owns DNS. A profile whose address
+  # is already a literal needs no pin, so the plan shows nothing for it —
+  # exactly what the real no-op does. $plan_tmp is reused for brevity; the real
+  # run's temp name carries its own pid (see build_tun_config / pin).
+  plan_addr="$(server_address_from_file "$PROFILE_CONFIG")"
+  if [[ -n $plan_addr ]]; then
+    if [[ $plan_addr =~ ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})$ ]] \
+       || { [[ $plan_addr == *:* ]] && [[ $plan_addr =~ ^[0-9A-Fa-f:.]{2,45}$ ]]; }; then
+      pin_ip="$plan_addr"
+    elif [[ $plan_addr =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$ ]]; then
+      pin_ip="$(getent ahostsv4 "$plan_addr" 2>/dev/null | awk '{print $1}' | head -n 1)"
+      [[ $pin_ip =~ ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})$ ]] || pin_ip=""
+      if [[ -z $pin_ip ]] && [[ $IPV6_ENABLED == true ]]; then
+        pin_ip="$(getent ahostsv6 "$plan_addr" 2>/dev/null | awk '{print $1}' | head -n 1)"
+        [[ $pin_ip =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || pin_ip=""
+      fi
+    fi
+  fi
+  if [[ -n $pin_ip && $pin_ip != "$plan_addr" ]]; then
+    dry_cmd jq --arg ip "$pin_ip" \
+      '(.outbounds // []) |= map(if (.tag // "") == "proxy" then (.settings.vnext = ((.settings.vnext // []) | if length > 0 then (.[0].address = $ip) else . end) | .settings.servers = ((.settings.servers // []) | if length > 0 then (.[0].address = $ip) else . end) else . end)' \
+      -- "$CONFIG_FILE"
+    dry_cmd chown "$INVOKER_UID:$INVOKER_GID" -- "$plan_tmp"
+    dry_cmd chmod 0600 -- "$plan_tmp"
+    dry_cmd mv -f -- "$plan_tmp" "$CONFIG_FILE"
+  elif [[ -z $pin_ip && -n $plan_addr ]]; then
+    # A hostname that does not resolve NOW would fail the real start (see
+    # pin_server_address); the plan says so instead of pretending.
+    dry_cmd true "# pin: $plan_addr does not resolve from here; the real run would refuse the start"
+  fi
+
+  # Mirror bind_direct_outbound: the direct (freedom) outbound's sockets are
+  # bound to the uplink, because xray's autoOutboundsInterface is ignored by
+  # this build — a route-pinned copy of the private ranges would override
+  # routes that matter, so the socket moves, not the routing table. No route
+  # lines exist for the direct ranges at all. $plan_tmp is reused here exactly
+  # as for the pin mirror; the real run's temp name carries its own pid.
+  if [[ -n $UPLINK_DEV ]]; then
+    dry_cmd jq --arg iface "$UPLINK_DEV" \
+      '(.outbounds // []) |= map(if (.protocol // "") == "freedom" then (.streamSettings = ((.streamSettings // {}) + {sockopt: ((.sockopt // {}) + {interface: $iface})})) else . end)' \
+      -- "$CONFIG_FILE"
+    dry_cmd chown "$INVOKER_UID:$INVOKER_GID" -- "$plan_tmp"
+    dry_cmd chmod 0600 -- "$plan_tmp"
+    dry_cmd mv -f -- "$plan_tmp" "$CONFIG_FILE"
+  else
+    dry_cmd true "# the direct outbound is not bound: no uplink exists; the real run would refuse the start"
+  fi
+
   if [[ $DNS_MODE == "resolved" ]]; then
     # Nothing to snapshot: systemd-resolved keeps the old configuration until we
     # override this link, and `resolvectl revert` later restores it.
@@ -1240,24 +1521,25 @@ plan_up() {
   # ROUTES come first, exactly as in the readiness loop's apply_routes: the
   # server's own addresses are exempted through the detected uplink BEFORE the
   # /1 pairs exist. In the real run the address is re-read from config.json
-  # (root never opens the profile); a dry run has no config.json, so the same
-  # outbound is derived from the PROFILE here — the same file the user's jq
-  # transform reads. Uplink detection probes the live machine: it is read-only,
-  # like detect_dns_mode above, and dry-run creates nothing either way.
-  local plan_addr ip use_via4=() use_via6=()
-  detect_uplink
-  detect_uplink6
-  plan_addr="$(server_address_from_file "$PROFILE_CONFIG")"
-  server_ip_list "$plan_addr"
-  [[ -n $UPLINK_GW ]] && use_via4=(via "$UPLINK_GW")
-  [[ -n $UPLINK_GW6 ]] && use_via6=(via "$UPLINK_GW6")
+  # (root never opens the profile); a dry run has no config.json, so the pinned
+  # literal from the mirror above (or the profile's own address) stands in.
+
   if [[ -n $UPLINK_DEV ]]; then
+    server_ip_list "${pin_ip:-$plan_addr}"
+    [[ -n $UPLINK_GW ]] && use_via4=(via "$UPLINK_GW")
+    [[ -n $UPLINK_GW6 ]] && use_via6=(via "$UPLINK_GW6")
     for ip in "${SERVER_IPS4[@]}"; do
       dry_cmd ip -4 route replace "$ip/32" "${use_via4[@]}" dev "$UPLINK_DEV"
     done
-    for ip in "${SERVER_IPS6[@]}"; do
-      dry_cmd ip -6 route replace "$ip/128" "${use_via6[@]}" dev "$UPLINK_DEV"
-    done
+    # The /128s are planned through the IPv6 default's own link, exactly as
+    # add_server_routes applies them. With no v6 default the real run would
+    # refuse (the server in that family could never be reached), so the plan
+    # shows no v6 server line rather than one with an empty device.
+    if [[ -n $UPLINK_DEV6 ]]; then
+      for ip in "${SERVER_IPS6[@]}"; do
+        dry_cmd ip -6 route replace "$ip/128" "${use_via6[@]}" dev "$UPLINK_DEV6"
+      done
+    fi
     dry_cmd ip addr replace 10.66.0.1/16 dev "$IFACE"
     dry_cmd ip link set dev "$IFACE" up
     dry_cmd ip route replace 0.0.0.0/1 dev "$IFACE"
@@ -1281,9 +1563,9 @@ plan_up() {
 
   # The rest of the lifecycle. `up` becomes the supervisor, so these are the
   # commands it would run when the engine exits; showing them here makes the
-  # whole mutation set visible before anything happens. The server-route
-  # deletions mirror remove_server_routes: the bare prefix forms it deletes,
-  # then the file it reads them from.
+  # whole mutation set visible before anything happens. The route deletions
+  # mirror remove_routes and remove_server_routes: the /1 pairs tied to the
+  # interface, then every prefix the routes file records, then the file itself.
   dry_cmd ip route del 0.0.0.0/1 dev "$IFACE"
   dry_cmd ip route del 128.0.0.0/1 dev "$IFACE"
   dry_cmd ip -6 route del ::/1 dev "$IFACE"
@@ -1325,16 +1607,29 @@ plan_down() {
     dry_cmd ip -6 route del 8000::/1 dev "$iface"
     did=true
   fi
-  # Server host routes are NOT tied to the tun device: they sit on the uplink. So
-  # they are planned from the same file the real remove_server_routes reads back,
-  # whenever it is there — with or without a live interface.
+  # Server routes are NOT tied to the tun device: they sit on the uplink, so
+  # they are planned from the same file the real remove_server_routes reads
+  # back, whenever it is there — with or without a live interface — as full
+  # prefixes, exactly as they were recorded.
   if [[ -f $ROUTES_FILE ]]; then
-    local family s_ip
-    # Same parse rule as remove_server_routes: default whitespace split.
-    while read -r family s_ip; do
+    local family s_prefix
+    # Same parse rule as remove_server_routes: default whitespace split, full
+    # prefixes, with the same courtesy for a bare address from an older build.
+    while read -r family s_prefix; do
       case $family in
-        4) [[ $s_ip =~ ^[0-9A-Fa-f.]{1,45}$ ]] && dry_cmd ip -4 route del "$s_ip/32" ;;
-        6) [[ $s_ip =~ ^[0-9A-Fa-f:.]{1,45}$ ]] && dry_cmd ip -6 route del "$s_ip/128" ;;
+        4|"6")
+          if [[ $s_prefix == */* ]]; then
+            [[ $s_prefix =~ ^[0-9A-Fa-f:.]{1,45}/[0123456789]{1,3}$ ]] || continue
+          else
+            [[ $s_prefix =~ ^[0-9A-Fa-f:.]{1,45}$ ]] || continue
+            s_prefix="${s_prefix}/32"
+            [[ $family == 6 ]] && s_prefix="${s_prefix%/32}/128"
+          fi
+          if [[ $family == 4 ]]; then
+            dry_cmd ip -4 route del "$s_prefix"
+          else
+            dry_cmd ip -6 route del "$s_prefix"
+          fi ;;
       esac
     done <"$ROUTES_FILE"
     dry_cmd rm -f -- "$ROUTES_FILE"
@@ -1384,6 +1679,27 @@ cmd_up() {
   # remembering `rm -f` at each of those sites.
   CONFIG_GUARD=1
   trap '[[ ${CONFIG_GUARD:-0} == 1 ]] && rm -f -- "$CONFIG_FILE"' EXIT
+
+  # PIN the server address while the system's own resolvers still answer, and
+  # BEFORE the engine starts: the /32 exemption and xray's dial target must be
+  # the same literal (see pin_server_address for why AsIs would otherwise
+  # re-resolve through the tunnel).
+  pin_server_address \
+    || fail_start "could not resolve the profile's server name before the tunnel took over DNS"
+
+  # Detect the uplink BEFORE the config is finalised: the direct outbound is
+  # about to be bound to its device (see bind_direct_outbound), so a start with
+  # no default route has nothing to bind to and cannot work. apply_routes
+  # consumes these globals later (detecting twice would only invite
+  # disagreement between the bound socket and the routes).
+  detect_uplink \
+    || fail_start "no default route on this machine; TUN mode has no uplink to route the tunnel through"
+  detect_uplink6
+
+  # Bind the direct outbound's sockets to the uplink while the config is still
+  # ours alone — after this the engine starts and reads it.
+  bind_direct_outbound \
+    || fail_start "could not bind the direct outbound to the uplink"
 
   snapshot_dns
 
