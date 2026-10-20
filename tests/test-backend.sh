@@ -717,7 +717,12 @@ check "the helper gate runs before the engine is stopped" \
 rm -f "$TUN_STATE"
 echo "$$" >"$PROXY_STATE/engine.pid"
 echo "$ID" >"$PROXY_STATE/active.id"
-out="$(OMARCHY_V2RAY_TUN_HELPER="$WORK/no-such-helper" "$BACKEND" tun-up "$ID" 2>/dev/null)"
+# Both seams pointed into $WORK: without the state seam a live tunnel on this
+# machine would read as "already active" and turn a needsHelper case into a
+# different refusal; without the helper seam the case would depend on whether
+# /usr/local/lib happens to hold an installed helper.
+out="$(OMARCHY_V2RAY_TUN_HELPER="$WORK/no-such-helper" OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" \
+       "$BACKEND" tun-up "$ID" 2>/dev/null)"
 check "tun-up without an installed helper is needsHelper" \
   jq -e '.ok == false and .needsHelper == true' <<<"$out"
 check "and it leaves the running proxy engine recorded" \
@@ -782,12 +787,75 @@ out="$("$BACKEND" tun-up 2>/dev/null)"
 check "tun-up without an id is refused" \
   jq -e '.ok == false and (.error | contains("needs a profile id"))' <<<"$out"
 
-rm -f "$WORK/pkexec.args"
-PKEXEC_ARGS="$WORK/pkexec.args" PATH="$PKEBIN:$PATH" "$BACKEND" tun-down >"$WORK/tun-down.json" 2>/dev/null
+# HERMETIC BY CONSTRUCTION: both seams point into $WORK. Without the state seam
+# this run would read the machine's real /run state — and the unprivileged stop
+# would SIGNAL whatever that file names, including a healthy tunnel's engine.
+# Without the helper seam the case depended on whether a helper really is
+# installed under /usr/local/lib (it is, on this machine — that is what made
+# these two assertions fail). "No state file" models the clean case, so rm it
+# explicitly whatever earlier cases left behind.
+rm -f "$WORK/pkexec.args" "$TUN_STATE"
+PKEXEC_ARGS="$WORK/pkexec.args" PATH="$PKEBIN:$PATH" \
+  OMARCHY_V2RAY_TUN_HELPER="$WORK/not-installed-helper" \
+  OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" \
+  "$BACKEND" tun-down >"$WORK/tun-down.json" 2>/dev/null
 check "tun-down asks for the helper install instead of prompting" \
   jq -e '.ok == false and .needsHelper == true and (.error | contains("install-tun"))' <"$WORK/tun-down.json"
 check "tun-down did not invoke pkexec without a checked helper" \
   test ! -e "$WORK/pkexec.args"
+
+# =============================================================================
+# The unprivileged stop: the TUN engine runs as the INVOKING USER with only
+# CAP_NET_ADMIN, so killing it does not need root at all — the helper's root
+# supervisor (still in `up`) notices the exit, restores DNS, removes the routes
+# and deletes the state file by itself. That is what this models:
+#
+#   * the stand-in engine is a binary copy of `sleep` named `xray`, so
+#     /proc/<pid>/comm reads "xray" exactly as the real engine's does;
+#   * the state file at the $WORK seam names that pid;
+#   * a watcher removes the state file once the pid is gone — the modelled
+#     supervisor (the real one runs as root and can never run inside a test).
+#
+# `tun-down` must then finish WITHOUT pkexec: ok:true, stopped:true, engine
+# gone, state file removed, and the recording pkexec double untouched.
+xray_pid=""
+if cp /usr/bin/sleep "$WORK/xray" && chmod +x "$WORK/xray"; then
+  "$WORK/xray" 120 & xray_pid=$!
+  sleep 0.1
+  if [[ "$(cat "/proc/$xray_pid/comm" 2>/dev/null)" == "xray" ]]; then
+    jq -n --arg pid "$xray_pid" \
+      '{profileId:"tun-test", iface:"omarchy-tun", pid:$pid, since:1700000000}' >"$TUN_STATE"
+    # -n $(cat comm), not -s on the file: /proc files report st_size == 0, so a
+    # size test would be false from birth and the watcher would delete the state
+    # file before tun-down ever saw it. An empty read covers both a killed-but-
+    # not-yet-reaped zombie (empty comm) and a fully dead pid (read error).
+    ( while [[ -n "$(cat -- "/proc/$xray_pid/comm" 2>/dev/null)" ]]; do sleep 0.1; done
+      rm -f -- "$TUN_STATE" ) & watcher_pid=$!
+    rm -f "$WORK/pkexec.args"
+    out="$(PKEXEC_ARGS="$WORK/pkexec.args" PATH="$PKEBIN:$PATH" \
+      OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" \
+      OMARCHY_V2RAY_TUN_HELPER="$WORK/never-installed-helper" \
+      "$BACKEND" tun-down 2>/dev/null)"; down_rc=$?
+    check "the unprivileged stop exits 0" test "$down_rc" -eq 0
+    check "it reports stopped, and it is not a pkexec launch" \
+      jq -e '.ok == true and .stopped == true and (has("launched") | not)' <<<"$out"
+    # Reap the stand-in so no zombie /proc entry survives the assertion.
+    wait "$xray_pid" 2>/dev/null
+    check "the engine process is gone" \
+      test ! -d "/proc/$xray_pid"
+    check "the modelled supervisor removed the state file" \
+      test ! -e "$TUN_STATE"
+    check "pkexec was never invoked" \
+      test ! -e "$WORK/pkexec.args"
+    wait "$watcher_pid" 2>/dev/null
+    xray_pid=""
+  else
+    printf '  SKIP the unprivileged stop (the stand-in does not report comm=xray)\n'
+    kill "$xray_pid" 2>/dev/null || true
+    xray_pid=""
+  fi
+fi
+[[ -n $xray_pid ]] && kill "$xray_pid" 2>/dev/null || true
 
 # =============================================================================
 echo

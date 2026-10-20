@@ -43,8 +43,13 @@ mkdir -p "$FAKEBIN" "$PROFILES" "$RUN"
 
 # The helper ignores everything from the environment except its explicit test
 # seams; these are the same two the unprivileged backend already uses for tests.
+# The TUN_STATE seam is not optional: the backend's unprivileged stop reads a
+# state file and may SIGNAL the pid it names. Without the seam every backend
+# invocation below would read the machine's real /run state — a live tunnel on
+# this machine would be killed by a test run.
 export OMARCHY_V2RAY_TUN_DRY_RUN=1
 export OMARCHY_V2RAY_TUN_RUN_DIR="$RUN"
+export OMARCHY_V2RAY_TUN_STATE="$RUN/state.json"
 export OMARCHY_V2RAY_HOME="$CONFIG_HOME"
 export PATH="$FAKEBIN:$PATH"
 
@@ -169,10 +174,21 @@ if [[ $HAVE_XRAY == true ]]; then
   check_contains "the run dir is traversal-only for the unprivileged panel" "$flat" "chmod 0711"
   check_contains "engine reads the config from the helper's run dir" "$flat" "$RUN/config.json"
   check_contains "the plan names the tun interface" "$flat" "autoOutboundsInterface"
+  # The routes the HELPER installs (the engine's own tun keys are ignored by
+  # xray on Linux, so the plan must show the ip commands that do the work).
+  check_contains "the plan sets the tunnel's address" "$flat" "ip addr replace 10.66.0.1/16"
+  check_contains "the plan installs the IPv4 upper-half route" "$flat" "ip route replace 0.0.0.0/1 dev"
+  check_contains "the plan installs the IPv4 lower-half route" "$flat" "ip route replace 128.0.0.0/1 dev"
   check_contains "the plan carries the IPv4 upper-half route" "$flat" "0.0.0.0/1"
   check_contains "the plan carries the IPv4 lower-half route" "$flat" "128.0.0.0/1"
   check_contains "the plan carries the IPv6 upper-half route" "$flat" "::/1"
   check_contains "the plan carries the IPv6 lower-half route" "$flat" "8000::/1"
+  # The server host route depends on a real default route existing, so it is
+  # asserted only when this environment can produce one.
+  if ip route show default >/dev/null 2>&1; then
+    check_contains "the plan exempts the server's own address from the tunnel" \
+      "$flat" "203.0.113.10/32"
+  fi
 
   # S4: the profile transform is the USER's jq, not root's. The plan must show
   # the setpriv argv (the `| cat > config.json` root side is a redirect and is
@@ -185,6 +201,7 @@ if [[ $HAVE_XRAY == true ]]; then
   # DNS handling depends on the machine, exactly as the helper decides it.
   if command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     check_contains "DNS points into the tunnel through resolvectl" "$flat" "1.1.1.1 9.9.9.9"
+    check_contains "the plan makes this link resolved's default route" "$flat" "resolvectl default-route"
     check_contains "the plan reverts the per-link DNS on teardown" "$flat" "resolvectl revert"
   else
     check_contains "the plan snapshots /etc/resolv.conf" "$flat" "$RUN/resolv.conf.orig"
@@ -196,6 +213,25 @@ else
   out="$("$HELPER" up "$ID" 2>/dev/null)"
   check "up refuses without an allowlisted xray" jq -e '.ok == false and (.error | contains("omarchy pkg aur add xray"))' <<<"$out"
 fi
+
+# The engine must NOT inherit the transition lock's fd: a flock lock belongs to
+# the open file description, so the engine's inherited copy of fd 9 kept the
+# mutex held for the engine's whole life, and `down` hung for 20s and then
+# refused with "another TUN operation is still in progress" while TUN was on.
+#
+# This is a static check on the start_engine body, not a dry-run assertion,
+# and that is deliberate: the plan prints ARGV ONLY (a redirection is applied
+# by the shell before exec, never argv — see plan_up's own comment), so a
+# printed `9>&-` would not merely be unenforced, it would be a lie — pasted
+# back it would reach xray as a literal argument instead of closing fd 9.
+# "The lock is released while the engine runs" cannot be observed without a
+# privileged engine, so the honest, always-runnable check is the one line of
+# the source that carries the fix.
+sed -n '/^start_engine() {/,/^}/p' "$HELPER" >"$WORK/start_engine.body"
+check "the engine is launched with the transition-lock fd closed (9>&-)" \
+  grep -q '9>&-' "$WORK/start_engine.body"
+check "the lock-fd close sits on the engine's redirect line, not elsewhere" \
+  grep -q '</dev/null 9>&- &' "$WORK/start_engine.body"
 
 # =============================================================================
 echo

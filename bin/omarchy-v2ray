@@ -981,6 +981,43 @@ cmd_tun_down() {
   # Idempotent by construction: the helper exits 0 when nothing is running, and
   # it must also work after the profile has been deleted, so there is nothing to
   # validate here beyond finding the helper.
+  #
+  # TURNING OFF MUST NOT COST A PASSWORD. The privileged engine runs as the
+  # INVOKING USER with only CAP_NET_ADMIN, so this user's own session may
+  # signal it; the root supervisor (the `up` still running) then does the part
+  # that needs root — restoring DNS, removing the routes and deleting the state
+  # file — and this only has to wait for its evidence. Try that path first:
+  #   * state active, pid present, /proc/<pid> exists, AND /proc/<pid>/comm is
+  #     xray — a plain `kill -0` cannot be used since EPERM and ESRCH collapse
+  #     (see tun_pid_alive), and a recycled pid must never be signalled on a
+  #     stale file's word alone;
+  #   * wait ~5s for the state file to disappear, which is how the supervisor
+  #     signals completion;
+  #   * on disappearance, the tunnel is off — report `stopped` with no pkexec
+  #     at all. On anything else (no state file, dead pid, a supervisor that
+  #     died before cleanup, a pid that is not an engine) the privileged
+  #     fallback below still exists.
+  local tun pid
+  tun="$(read_tun_state)"
+  if [[ "$(jq -r '.active' <<<"$tun")" == true ]]; then
+    pid="$(jq -r '.pid' <<<"$tun")"
+    # read_tun_state already validated the pid shape; the comm check is what
+    # makes it safe to signal a pid that only a state file named.
+    if [[ -n $pid && -d /proc/$pid ]] \
+       && [[ "$(cat -- "/proc/$pid/comm" 2>/dev/null)" == "xray" ]]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      local i
+      for i in $(seq 1 25); do
+        [[ -f $TUN_STATE_FILE ]] || break
+        sleep 0.2
+      done
+      if [[ ! -f $TUN_STATE_FILE ]]; then
+        jq -n '{ok:true, stopped:true}'
+        exit 0
+      fi
+    fi
+  fi
+
   launch_tun_helper down
   jq -n '{ok:true, launched:true}'
   exit 0
