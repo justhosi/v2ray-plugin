@@ -135,7 +135,9 @@ bin/omarchy-v2ray install-tun
 
 It opens a visible terminal and runs one `pkexec` command, so you can watch the
 install happen and are asked for your password once. Nothing else in the plugin
-prompts: proxy mode never asks, and TUN asks only when you start or stop it.
+prompts: proxy mode never asks, and TUN asks only when you start it. Stopping
+needs no password — the engine runs as you, so your own session can stop it, and
+the still-running supervisor finishes the part that needs root.
 
 **Why it is installed outside the plugin tree.** `~/.config/omarchy/plugins/`
 belongs to you, and any process running as you can rewrite it. A helper that
@@ -282,10 +284,13 @@ a separate file, `bin/omarchy-v2ray-tun`, installed outside the plugin tree by
 `install-tun` and executed only through `pkexec`. The bar launches it, forgets
 about it, and polls the state file it writes.
 
-That split is why TUN asks for authorisation once per start and once per stop,
-while proxy mode never asks at all. polkit's keep-alive shortens a rapid off/on
-into a single prompt, but it is still an authorisation, not a switch the bar can
-flip by itself. "What TUN mode actually does" below covers the mechanics;
+That split is why TUN asks for authorisation once per start, while proxy mode
+never asks at all. Stopping is free: the engine runs as **you**, with only
+`CAP_NET_ADMIN` added, so your own session can signal it, and the root supervisor
+that is still running does the part that needs root — restoring DNS and removing
+the routes — before it exits. polkit's keep-alive shortens a rapid off/on into a
+single prompt, but it is still an authorisation, not a switch the bar can flip
+by itself. "What TUN mode actually does" below covers the mechanics;
 [Troubleshooting](#troubleshooting) covers a prompt that never appears.
 
 ### Every interaction
@@ -293,11 +298,11 @@ flip by itself. "What TUN mode actually does" below covers the mechanics;
 | Where | What it does |
 |---|---|
 | **Left click** the icon | open the popup |
-| **Right click** the icon | connect / disconnect (the "VPN switch"); while TUN is on, this stops TUN — a polkit prompt |
+| **Right click** the icon | connect / disconnect (the "VPN switch"); while TUN is on, this stops TUN — no prompt |
 | **Middle click** the icon | re-read state |
 | **Left click** a server row | connect it (or disconnect it, if it is the active one) |
 | **Right click** a server row | copy that server's original share link |
-| **TUN (SYSTEM-WIDE)** switch | turn the system-wide tunnel on or off — one polkit prompt either way |
+| **TUN (SYSTEM-WIDE)** switch | turn the system-wide tunnel on (one polkit prompt) or off (no prompt) |
 | **Speedometer** row button | measure real latency through that server |
 | **Copy** row button | copy the share link |
 | **Bin** row button | delete — needs a second click to confirm |
@@ -370,27 +375,42 @@ actually caused it.
 
 The helper then rebuilds the profile's config — server, transport and REALITY
 parameters untouched — with a `tun` inbound, and runs the engine as **you**, with
-only `CAP_NET_ADMIN` added, never as root. Routing is the tun inbound's job: it
-installs two pairs of `/1` routes, `0.0.0.0/1` and `128.0.0.0/1`, plus `::/1` and
-`8000::/1` for IPv6. Together they cover the whole address space and are more
+only `CAP_NET_ADMIN` added, never as root. Routing is the helper's job, not the
+engine's: this xray build accepts the tun inbound's `gateway`,
+`autoSystemRoutingTable` and `autoOutboundsInterface` and silently ignores them
+on Linux, so the device alone would come up with no address and no routes. The
+helper therefore gives the interface its address (`10.66.0.1/16`, plus
+`fc00:66::1/64` when the host has an IPv6 default), brings the link up, and
+installs two pairs of `/1` routes — `0.0.0.0/1` and `128.0.0.0/1`, plus `::/1`
+and `8000::/1` for IPv6. Together they cover the whole address space and are more
 specific than the real default route, so the kernel prefers them without the
-helper replacing — and later having to guess at — your default route.
+helper replacing — and later having to guess at — your default route. Before the
+`/1`s exist it also pins every address of the proxy outbound to the physical
+uplink as a `/32` (or `/128`) route, so the engine's own dial out never falls
+back into the tun it is filling.
 
 DNS is moved into the tunnel as soon as the interface exists. On a
 systemd-resolved machine the helper attaches `1.1.1.1` and `9.9.9.9` to the tun
-link and claims `~.` for every domain, so lookups cannot fall back to the
-physical link; elsewhere it rewrites `/etc/resolv.conf` from a backup it took
-first. Both are undone on the way out.
+link, claims `~.` for every domain and sets the link as the default route
+(`resolvectl default-route … yes`), so an unlisted name cannot still be resolved
+through the physical link; elsewhere it rewrites `/etc/resolv.conf` from a backup
+it took first. Both are undone on the way out.
 
 `up` does not exit when the engine starts: it supervises. On every exit path —
 clean engine exit, crash, or a signal during the readiness window — it restores
-DNS, deletes the four routes and removes its state file, so a dead engine cannot
-leave the machine pointed at a tun device that no longer exists. `tun-down` does
-the same work explicitly and is safe when nothing is running.
+DNS (including the `resolvectl default-route` it set), removes the four `/1`
+routes and every per-server host route it recorded in
+`/run/omarchy-v2ray-tun/routes`, and deletes its state file, so a dead engine
+cannot leave the machine pointed at a tun device that no longer exists.
+`tun-down` does the same work explicitly and is safe when nothing is running.
 
 "Connected" in TUN mode is evidence rather than optimism: the helper writes its
-state file only after the interface exists and the profile's SOCKS port is
-listening, and `status` reports TUN as the connection only from that file.
+state file only after the interface exists, the routes through it are installed
+and verified — a probe for `1.1.1.1` must come back through the tun and every
+server address must not — and the profile's SOCKS port is listening. `status`
+reports TUN as the connection only from that file. If the proof fails the start
+fails instead: the panel shows the error rather than claiming a tunnel your
+traffic is still bypassing.
 
 TUN needs the **xray** core. `v2ray` has no tun inbound and does not reject the
 key either, so a TUN config handed to it starts an ordinary local proxy and the
@@ -442,6 +462,9 @@ helper into a root-owned directory that `status` only ever reads:
 ├── last-error                   # why the last start failed               (0644)
 ├── engine.log                   # engine narration                        (0640)
 ├── helper.log                   # the helper's own log                    (0640)
+├── routes                       # the per-server host routes the helper
+│                                # installed, so `down` deletes exactly
+│                                # what `up` put in                        (0600)
 └── config.json                  # the credential; deleted once the engine
                                  # has parsed it                           (0600)
 ```
@@ -476,10 +499,13 @@ bin/omarchy-v2ray remove <id>
 bin/omarchy-v2ray import < payload.json   # JSON on stdin — and only on stdin
 ```
 
-`tun-up` and `tun-down` print a receipt and exit; the authorisation and the
-tunnel happen in the privileged process behind them, so poll `tun-status` for the
-result. While TUN is active the backend refuses `start` and `toggle`: the TUN
-engine owns the same local ports, and the way out is `tun-down`.
+`tun-up` prints a receipt and exits; the authorisation and the tunnel happen in
+the privileged process behind it, so poll `tun-status` for the result. `tun-down`
+needs no authorisation — it signals the engine you own and lets the still-running
+supervisor finish the root part — but it too returns before that finishes, so
+poll `tun-status` here as well. While TUN is active the backend refuses `start`
+and `toggle`: the TUN engine owns the same local ports, and the way out is
+`tun-down`.
 
 This is the file to read when something breaks: it is plain bash, it needs no
 display, and it explains itself.
@@ -617,12 +643,31 @@ systemd-resolved — shows where lookups are being sent. Turn TUN off and DNS co
 back with the routing.
 
 **How do I get out of TUN mode?** `bin/omarchy-v2ray tun-down`, or the switch
-itself (one prompt). It is idempotent, it works after the profile has been
-deleted, and restoring DNS and removing the routes is its only job.
-`bin/omarchy-v2ray tun-status` is the read-only way to ask what is actually up.
-If the supervisor was killed outright, the next start recovers
-`/etc/resolv.conf` from its backup before taking a fresh snapshot, and `tun-down`
-still cleans up an interface left without a state file.
+itself — neither asks for a password, because the engine runs as you and your own
+session can stop it, while the root supervisor finishes restoring DNS and the
+routes. It is idempotent, it works after the profile has been deleted, and
+restoring DNS and removing the routes is its only job. `bin/omarchy-v2ray
+tun-status` is the read-only way to ask what is actually up. If the supervisor
+was killed outright, the next start recovers `/etc/resolv.conf` from its backup
+before taking a fresh snapshot, and `tun-down` still cleans up an interface left
+without a state file.
+
+**TUN start fails with "could not route traffic through omarchy-tun".** The
+helper got the interface up but could not *prove* the routing, so it tore
+everything back down rather than claim a tunnel your traffic would bypass. Either
+the kernel refused one of the routes it tried to install (there was no default
+route to pin the server against, or a conflicting route table), or its proof
+failed — a probe for `1.1.1.1` did not come back through the tun, or one of the
+server's addresses still resolved through it. Nothing is left half-on: the
+address, the `/1` routes and the server exemptions are all removed on the way
+out, so the machine is back on a normal direct connection.
+
+**A server named by hostname lost its exemption.** The server's address (or
+addresses) are looked up once, when TUN starts, and pinned to the physical uplink
+then. If the name points at a rotating set of IPs — a CDN or a load balancer — an
+address that appears after the start has no exemption, and the engine's own dial
+can fall into the tun. Re-start TUN to re-resolve the name and pin the current
+addresses.
 
 **Why can't I turn the proxy back on while TUN is up?** Both engines bind the
 same ports: the TUN config is the profile's config plus a tun inbound. The
@@ -840,8 +885,8 @@ helper to execute). They are the only intended skips, and the suite still exits
 machine around a prompt that can take minutes: a TUN start is gated so a connect
 click cannot race it onto the same ports, the gate survives a stale error file
 and the 30-second pulse, it gives up after two minutes instead of blocking for
-the session, and a stop still reaches the helper so a cancelled stop prompt
-cannot strand the switch. It prints `SKIP` without quickshell and a Wayland
+the session, and a stop still reaches the helper so an unanswered stop cannot
+strand the switch. It prints `SKIP` without quickshell and a Wayland
 session, like the import suite.
 
 ```bash
