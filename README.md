@@ -4,8 +4,16 @@ Paste a share link, get a working tunnel.
 
 This plugin puts a **shield icon** in your Omarchy bar. You paste a server link
 (`vless://`, `vmess://`, `trojan://` or `ss://`), press **Add**, and click the
-server — a tunnel comes up. Everything runs as your user: no root, no password
-prompts, and nothing in `/etc` is touched.
+server — a tunnel comes up.
+
+That tunnel comes in two shapes. **Proxy mode** is the default: the engine opens
+a SOCKS and an HTTP proxy on loopback, and only the apps you point at them are
+tunnelled. It runs entirely as your user — no root, no password prompt, and
+nothing written in `/etc`. **TUN mode** is the second switch in the popup: it
+routes every packet on the machine and points DNS into the tunnel. That needs
+`CAP_NET_ADMIN`, so it is done by a separate privileged helper, installed once,
+that only ever runs through a polkit prompt. The bar itself never holds root;
+see "What TUN mode actually does" below.
 
 ---
 
@@ -64,18 +72,24 @@ It will:
 4. ask whether to enable it now, and which bar section to use it in.
 
 Answer **yes**, then choose **right**. There is no build step and nothing to
-compile — the QML and the shell script are the whole program.
+compile — the QML and the shell script are the whole program. Proxy mode is
+complete at this point; TUN mode has one more, one-time install (see below).
 
 ### Step 3 — look at your bar
 
-A **shield** appears in the bar section you picked. It has three looks:
+A **shield** appears in the bar section you picked. It has these looks:
 
 | look | meaning |
 |---|---|
 | dim shield with a slash | the tunnel is off |
-| bright shield with a check mark | the tunnel is on |
+| bright shield with a check mark | the tunnel is on, as a local proxy |
+| bright shield with a check mark **and a dot** underneath | the tunnel is on, in TUN mode — the whole machine is routed |
 | pulsing shield | starting or stopping right now |
 | shield with a **!** badge | no v2ray core on `PATH` — see step 1 |
+
+Both kinds of tunnel are "on", so the check mark keeps that one meaning and the
+dot is what tells them apart. At bar size the difference is deliberately quiet:
+it is the *mode*, not another state.
 
 If nothing appears, reload the shell:
 
@@ -106,6 +120,36 @@ omarchy restart shell
 omarchy plugin update community.v2ray-client
 ```
 
+### Only for TUN mode: install the privileged helper
+
+TUN mode is the one part of this plugin that needs root, so it is split in two:
+the bar and `bin/omarchy-v2ray` decide *what* to do, and a small root-owned
+helper at `/usr/local/lib/omarchy-v2ray/omarchy-v2ray-tun` does the privileged
+part. Install it once — from the popup (press the TUN switch; the backend refuses
+without a prompt and offers an **Install the TUN helper** row), or from a
+terminal:
+
+```bash
+bin/omarchy-v2ray install-tun
+```
+
+It opens a visible terminal and runs one `pkexec` command, so you can watch the
+install happen and are asked for your password once. Nothing else in the plugin
+prompts: proxy mode never asks, and TUN asks only when you start or stop it.
+
+**Why it is installed outside the plugin tree.** `~/.config/omarchy/plugins/`
+belongs to you, and any process running as you can rewrite it. A helper that
+`pkexec` executed from there would be replaceable, and one password prompt later
+the replacement would run as root — silently so, once a polkit rule named that
+path. The executed copy therefore lives in a root-owned directory, and both
+halves verify its owner and mode before anything privileged happens. That is a
+security property, not an implementation detail; do not "helpfully" symlink it
+back into the plugin directory.
+
+The installed file is a copy. Updating the plugin does not update it, so run
+`install-tun` again after an update, and remove it yourself when you remove the
+plugin (see [Uninstall](#uninstall)).
+
 ---
 
 ## Use it
@@ -123,9 +167,12 @@ omarchy plugin update community.v2ray-client
 
 ### Then point an app at it
 
-**This is the step people skip, and then think the plugin is broken.** Connecting
-only *opens* the tunnel — it does not reroute anything by itself. Until an app is
-told to use it, that app keeps talking to the internet directly, on your real IP.
+**This is the step people skip, and then think the plugin is broken.** In
+**proxy mode**, connecting only *opens* the tunnel — it does not reroute
+anything by itself. Until an app is told to use it, that app keeps talking to the
+internet directly, on your real IP. In **TUN mode** this whole section is
+unnecessary: every app is already routed, though the two ports below stay bound
+for apps that prefer an explicit proxy.
 
 The engine listens on two doors:
 
@@ -148,7 +195,8 @@ curl -s --proxy socks5h://127.0.0.1:10808 https://api.ipify.org; echo
 ```
 
 Two **different** addresses means the tunnel is healthy and the problem — if any
-— is in the app's settings, not here.
+— is in the app's settings, not here. In TUN mode they are the *same* address:
+the direct `curl` is inside the tunnel too, and there is nothing left to point.
 
 #### Worked example: Brave
 
@@ -224,19 +272,32 @@ rm ~/.local/share/applications/brave-browser.desktop
   applies whether or not the tunnel is up, so a stopped engine means those apps
   simply fail to connect. Delete the file to undo it.
 
-There is deliberately **no TUN mode**: hijacking all system traffic needs root,
-and a bar widget must never prompt for a password. That is a real limitation,
-not an oversight — see "Extending" below for the supported way to add it.
+### TUN mode, and why it is not part of the bar process
+
+Routing all system traffic needs a tun device, and a tun device needs
+`CAP_NET_ADMIN` — root's authority. A bar widget must never hold that: the shell
+runs unsandboxed code, reloads on every file save, and must not be able to
+prompt for a password or quietly acquire a capability. So the privileged part is
+a separate file, `bin/omarchy-v2ray-tun`, installed outside the plugin tree by
+`install-tun` and executed only through `pkexec`. The bar launches it, forgets
+about it, and polls the state file it writes.
+
+That split is why TUN asks for authorisation once per start and once per stop,
+while proxy mode never asks at all. polkit's keep-alive shortens a rapid off/on
+into a single prompt, but it is still an authorisation, not a switch the bar can
+flip by itself. "What TUN mode actually does" below covers the mechanics;
+[Troubleshooting](#troubleshooting) covers a prompt that never appears.
 
 ### Every interaction
 
 | Where | What it does |
 |---|---|
 | **Left click** the icon | open the popup |
-| **Right click** the icon | connect / disconnect (the "VPN switch") |
+| **Right click** the icon | connect / disconnect (the "VPN switch"); while TUN is on, this stops TUN — a polkit prompt |
 | **Middle click** the icon | re-read state |
 | **Left click** a server row | connect it (or disconnect it, if it is the active one) |
 | **Right click** a server row | copy that server's original share link |
+| **TUN (SYSTEM-WIDE)** switch | turn the system-wide tunnel on or off — one polkit prompt either way |
 | **Speedometer** row button | measure real latency through that server |
 | **Copy** row button | copy the share link |
 | **Bin** row button | delete — needs a second click to confirm |
@@ -255,6 +316,7 @@ latency probe) is running.
 | `Enter` | connect / disconnect the highlighted row |
 | `Delete` | arm delete for the highlighted row (press twice) |
 | `t` | toggle the connection |
+| `u` | turn TUN mode on or off |
 | `r` | refresh |
 | `p` | ping the highlighted server |
 | `c` | copy the highlighted server's link |
@@ -268,24 +330,72 @@ latency probe) is running.
 * A **dim line** confirms things that worked — "Copied to clipboard",
   "Added <server>". It fades by itself.
 * The **LOCAL PROXY** section, visible while connected, spells out the ports and
-  the `all_proxy` line.
+  the `all_proxy` line. In TUN mode it says outright that nothing has to be
+  pointed at them — they stay bound for apps that prefer an explicit proxy.
+* The **TUN (SYSTEM-WIDE)** section, with its switch and one line of state. The
+  line is the backend's own answer: "waiting for authorisation" while polkit is
+  up, the interface name while the tunnel is live, or the reason it cannot start
+  here (no xray). When the privileged helper is missing, a refused click turns
+  the section into an **Install the TUN helper** row instead of a password
+  prompt that cannot work. While TUN is live the bar shield gains a small dot
+  under its check mark: both modes are "on", but only one reroutes the machine.
 
 ### What "connect" actually does
 
-The engine binds the two local proxies and nothing else. It never touches your
-routing table, your DNS, or any other app's traffic. "Connected" therefore means
-*the tunnel is open*, not *your traffic is inside it* — and that gap is the
-single most common "it isn't working" report, which is why the section above
-exists.
+In **proxy mode** the engine binds the two local proxies and nothing else. It
+never touches your routing table, your DNS, or any other app's traffic.
+"Connected" therefore means *the tunnel is open*, not *your traffic is inside
+it* — and that gap is the single most common "it isn't working" report, which is
+why the section above exists.
 
-One useful consequence: nothing else on your machine can break because of this
-plugin. Stop the engine and the only thing that changes is that apps pointed at
-`127.0.0.1:10808` lose their tunnel; everything else carries on as before.
+One useful consequence of that design: in proxy mode nothing else on your
+machine can break because of this plugin. Stop the engine and the only thing
+that changes is that apps pointed at `127.0.0.1:10808` lose their tunnel;
+everything else carries on as before. TUN mode deliberately gives that up — it
+changes the whole machine, and has its own recovery story below.
 
 If your *direct* `curl` (the one without `--proxy`) already reports the server's
-IP, then something else — tun2socks, another VPN, your router's own v2ray, a
-proxy environment variable — is routing everything, and this plugin is redundant
-on that machine.
+IP while the shield is on, then either something else is routing everything —
+tun2socks, another VPN, your router's own v2ray, a proxy environment variable —
+or TUN mode is on, where that is the expected result, not a sign of redundancy.
+
+#### What TUN mode actually does
+
+The switch stops the local proxy engine first. That is not tidiness: the TUN
+config is the same profile with a tun inbound added, so it still binds the
+profile's SOCKS and HTTP ports, and two engines cannot own 10808/10809. Without
+the handover the privileged one dies inside its readiness window, and the error
+it reports is about the engine exiting, not about the port collision that
+actually caused it.
+
+The helper then rebuilds the profile's config — server, transport and REALITY
+parameters untouched — with a `tun` inbound, and runs the engine as **you**, with
+only `CAP_NET_ADMIN` added, never as root. Routing is the tun inbound's job: it
+installs two pairs of `/1` routes, `0.0.0.0/1` and `128.0.0.0/1`, plus `::/1` and
+`8000::/1` for IPv6. Together they cover the whole address space and are more
+specific than the real default route, so the kernel prefers them without the
+helper replacing — and later having to guess at — your default route.
+
+DNS is moved into the tunnel as soon as the interface exists. On a
+systemd-resolved machine the helper attaches `1.1.1.1` and `9.9.9.9` to the tun
+link and claims `~.` for every domain, so lookups cannot fall back to the
+physical link; elsewhere it rewrites `/etc/resolv.conf` from a backup it took
+first. Both are undone on the way out.
+
+`up` does not exit when the engine starts: it supervises. On every exit path —
+clean engine exit, crash, or a signal during the readiness window — it restores
+DNS, deletes the four routes and removes its state file, so a dead engine cannot
+leave the machine pointed at a tun device that no longer exists. `tun-down` does
+the same work explicitly and is safe when nothing is running.
+
+"Connected" in TUN mode is evidence rather than optimism: the helper writes its
+state file only after the interface exists and the profile's SOCKS port is
+listening, and `status` reports TUN as the connection only from that file.
+
+TUN needs the **xray** core. `v2ray` has no tun inbound and does not reject the
+key either, so a TUN config handed to it starts an ordinary local proxy and the
+system-wide tunnel silently never exists. The switch says so and offers the xray
+install instead of a password prompt that cannot help.
 
 ---
 
@@ -323,13 +433,36 @@ Profiles are written with `umask 077`, because the config file contains your
 UUID — treat that directory like a password store. The popup's footer has a
 button that opens it in your file manager.
 
+TUN mode keeps nothing here. Its transient state is written by the privileged
+helper into a root-owned directory that `status` only ever reads:
+
+```
+/run/omarchy-v2ray-tun/          # tmpfs, 0711 — gone at reboot, not your data
+├── state.json                   # profile id, interface, pid, start time  (0644)
+├── last-error                   # why the last start failed               (0644)
+├── engine.log                   # engine narration                        (0640)
+├── helper.log                   # the helper's own log                    (0640)
+└── config.json                  # the credential; deleted once the engine
+                                 # has parsed it                           (0600)
+```
+
+`state.json` and `last-error` are the two files worth reading when TUN misbehaves:
+the first is what makes the switch say "on", the second is what the panel shows
+in its red line. The state file holds the profile id, interface, pid and start
+time and no secret; the error file is a flattened engine log tail, never the
+profile config.
+
 ### The backend CLI
 
 The plugin is a thin UI over `bin/omarchy-v2ray`, which you can run yourself.
 Every subcommand prints JSON (except `log`):
 
 ```bash
-bin/omarchy-v2ray status              # engine + connection state
+bin/omarchy-v2ray status              # engine + connection state, and mode: tun/proxy/off
+bin/omarchy-v2ray tun-status          # TUN: available here, active, why not
+bin/omarchy-v2ray tun-up <id>         # start TUN (pkexec; returns before you authenticate)
+bin/omarchy-v2ray tun-down            # stop it — idempotent, safe when nothing runs
+bin/omarchy-v2ray tun-toggle <id>     # down when active, otherwise up
 bin/omarchy-v2ray list                # imported profiles
 bin/omarchy-v2ray start <id>
 bin/omarchy-v2ray stop
@@ -337,10 +470,16 @@ bin/omarchy-v2ray toggle
 bin/omarchy-v2ray ping <id>           # real latency, via a throwaway engine
 bin/omarchy-v2ray link <id>           # print the share link
 bin/omarchy-v2ray log 50
+bin/omarchy-v2ray install-tun         # install the privileged helper (see the install section)
 bin/omarchy-v2ray autostart <id>|off
 bin/omarchy-v2ray remove <id>
 bin/omarchy-v2ray import < payload.json   # JSON on stdin — and only on stdin
 ```
+
+`tun-up` and `tun-down` print a receipt and exit; the authorisation and the
+tunnel happen in the privileged process behind them, so poll `tun-status` for the
+result. While TUN is active the backend refuses `start` and `toggle`: the TUN
+engine owns the same local ports, and the way out is `tun-down`.
 
 This is the file to read when something breaks: it is plain bash, it needs no
 display, and it explains itself.
@@ -370,6 +509,13 @@ plugin settings UI):
 > Ports are baked into a profile's config at import time (that is what makes
 > `start <id>` work from a bare terminal with no plugin involved). To move an
 > existing profile to new ports, re-import its link after changing the setting.
+
+TUN mode has no settings of its own, but it uses those same ports: the
+privileged config is the profile's config plus a tun inbound, so it rebinds
+whatever SOCKS/HTTP pair that profile was imported with. That is also why the
+proxy engine is stopped before TUN starts, and why the two modes cannot run at
+once. The interface name (`omarchy-tun`) and the resolvers used inside the tunnel
+(`1.1.1.1`, `9.9.9.9`) are chosen by the installed helper, not by the widget.
 
 ---
 
@@ -417,16 +563,73 @@ A REALITY server on the v2ray core cannot work at all (see the REALITY entry
 above). On xray, a stale `pbk=` public key or a mismatched `sni=` is the usual
 cause.
 
-**Connecting works but nothing loads.** Check you actually pointed the app at
-the proxy (`127.0.0.1:10808`) — the tunnel is not system-wide by design. See
-"What connect actually does" above for the two `curl` commands that tell you
-whether the app or the tunnel is at fault.
+**Connecting works but nothing loads (proxy mode).** Check you actually pointed
+the app at the proxy (`127.0.0.1:10808`) — in proxy mode the tunnel is not
+system-wide by design. See "What connect actually does" above for the two `curl`
+commands that tell you whether the app or the tunnel is at fault. (With TUN on,
+this entry does not apply: everything is already routed.)
 
-**The bar says ON, pages load, but my IP is still my own.** This is the same
-thing, seen from the other end: the pages are loading *directly*, not through
-the tunnel, because the browser was never pointed at `127.0.0.1:10808`. Nothing
-is broken. Set the proxy in the app, or `export all_proxy=socks5h://127.0.0.1:10808`
-before launching it.
+**The bar says ON, pages load, but my IP is still my own (proxy mode).** This is
+the same thing, seen from the other end: the pages are loading *directly*, not
+through the tunnel, because the browser was never pointed at `127.0.0.1:10808`.
+Nothing is broken. Set the proxy in the app, or
+`export all_proxy=socks5h://127.0.0.1:10808` before launching it. If the shield
+has the TUN dot, this cannot happen — every app is routed — so treat it as "TUN
+is not actually up" and check `bin/omarchy-v2ray tun-status`.
+
+**The TUN switch is disabled and says TUN needs the xray core.** `v2ray` has no
+`tun` inbound, and it does not reject the key either, so a TUN config handed to
+it would start an ordinary local proxy and never create a tun device. Install
+xray (see the REALITY entry above); the switch becomes usable and existing
+profiles keep working unchanged, because only an inbound is added.
+
+**The TUN switch says the helper is not installed.** The privileged half is not
+part of the plugin tree and `omarchy plugin add` does not install it; run
+`bin/omarchy-v2ray install-tun` (see "Only for TUN mode" above). The panel offers
+an **Install the TUN helper** row for the same thing. The backend refuses
+*before* asking for a password in this case, so a missing helper never leaves a
+dialog you cannot satisfy.
+
+**Pressing TUN does nothing, and no password prompt appears.** TUN launches
+`pkexec`, and `pkexec` needs a polkit authentication agent in your graphical
+session to draw the dialog. Without one the request is never shown, and because
+the launcher is detached and its output discarded, nothing happens on screen. A
+normal Omarchy desktop runs that agent; a bare TTY login or a hand-rolled session
+may not. Check whether a prompt can appear at all with `pkexec true` in a
+terminal, and ask the backend what it sees with `bin/omarchy-v2ray tun-status`.
+The panel pulses for 30 seconds, then reports that the attempt is still
+unconfirmed; it keeps proxy connects refused for up to two minutes, so a late
+authorisation cannot race a second engine onto the same ports.
+
+**I cancelled the password prompt and now nothing connects.** Starting TUN stops
+the local proxy engine first, because the privileged engine needs the same
+10808/10809 ports. A cancelled prompt therefore leaves you with no proxy and no
+tunnel — and nothing recorded, because no helper ran to write an error. The panel
+treats the hand-off as unconfirmed for up to two minutes and then says so. A
+terminal is not gated: `bin/omarchy-v2ray start <id>` brings the proxy back
+immediately.
+
+**TUN is on but names no longer resolve.** The helper points the system resolver
+at `1.1.1.1` and `9.9.9.9` *through* the tunnel. A server that does not carry UDP
+(or drops port 53) leaves IP traffic working while every lookup fails.
+`resolvectl status omarchy-tun` — or `/etc/resolv.conf` on a machine without
+systemd-resolved — shows where lookups are being sent. Turn TUN off and DNS comes
+back with the routing.
+
+**How do I get out of TUN mode?** `bin/omarchy-v2ray tun-down`, or the switch
+itself (one prompt). It is idempotent, it works after the profile has been
+deleted, and restoring DNS and removing the routes is its only job.
+`bin/omarchy-v2ray tun-status` is the read-only way to ask what is actually up.
+If the supervisor was killed outright, the next start recovers
+`/etc/resolv.conf` from its backup before taking a fresh snapshot, and `tun-down`
+still cleans up an interface left without a state file.
+
+**Why can't I turn the proxy back on while TUN is up?** Both engines bind the
+same ports: the TUN config is the profile's config plus a tun inbound. The
+backend therefore refuses `start` and `toggle` with "TUN mode is on — turn it off
+from the TUN switch first", rather than starting a second engine that would lose
+the bind and leave `status` describing a connection the machine is not using.
+Turn TUN off first.
 
 **I clicked a button and nothing seemed to happen.** Every row action now
 answers visibly: the button shrinks and darkens the moment the mouse goes down,
@@ -539,19 +742,18 @@ plugin).
 |---|---|
 | `Panel.qml` | the bar button and the popup; draws only, runs nothing |
 | `Service.qml` | all state and every process spawn |
-| `V2rayShield.qml` | the hand-drawn bar icon (three states + a warning badge) |
+| `V2rayShield.qml` | the hand-drawn bar icon: on, off, starting, a warning badge, and the dot that marks TUN |
 | `V2rayActionButton.qml` | the small row buttons, with press/busy/confirmed feedback |
 | `Model.js` | share-link parsing and engine-config building |
-| `bin/omarchy-v2ray` | the backend CLI; every subcommand answers with JSON |
+| `bin/omarchy-v2ray` | the backend CLI; every subcommand answers with JSON, and it never gains privilege |
+| `bin/omarchy-v2ray-tun` | the privileged half of TUN mode; installed outside the plugin tree, only ever run through `pkexec` |
 | `tests/test-backend.sh` | the offline test suite |
 | `tests/test-service-import.sh` | drives the real panel under quickshell — import, clipboard and public IPC surface — to prove the credential never reaches argv |
+| `tests/test-service-tun.sh` | drives the real `Service.qml` through the TUN state machine, including slow and cancelled prompts |
+| `tests/test-tun-helper.sh` | the privileged helper in dry-run, plus the launcher's refusal paths with a recording `pkexec` |
 
 ## Extending it
 
-* **TUN mode / system-wide VPN.** Add a subcommand to the backend script that
-  writes an engine `tun` inbound and re-executes it through `pkexec`, then a
-  button in the popup that calls it. Keep the privileged part in its own
-  script: the shell process must never try to prompt for a password.
 * **Subscriptions.** A `refresh-subscription <url>` subcommand that fetches,
   splits, and imports every link would slot in without touching the QML — the
   parser already handles all four schemes.
@@ -613,6 +815,41 @@ stays green headless, and can also be run on its own:
 ./tests/test-service-import.sh
 ```
 
+### TUN: the helper and the panel switch
+
+`tests/test-tun-helper.sh` is the counterpart for `bin/omarchy-v2ray-tun`, the
+only part of the project that would need root. No test may create a tun device,
+rewrite `/etc/resolv.conf` or ask polkit for anything, so the behavioural cases
+drive the real helper in dry-run mode (`OMARCHY_V2RAY_TUN_DRY_RUN=1`): the whole
+validation path runs, the exact argv of every command it *would* run is printed,
+and it exits without touching `/run`, DNS or a process. The launcher cases put a
+recording `pkexec` double on `PATH` and prove that an uninstalled, user-owned or
+symlinked helper is refused with `needsHelper` and never reaches `pkexec` at all.
+
+```bash
+./tests/test-tun-helper.sh
+```
+
+Two checks need root and print `SKIP` for a normal user: a foreign-owned config
+(changing a file owner needs root) and the positive launch (it needs a root-owned
+helper to execute). They are the only intended skips, and the suite still exits
+0 with them.
+
+`tests/test-service-tun.sh` is the panel side. It starts quickshell with the real
+`Service.qml`, calls `applyStatus()` with crafted replies, and pins the state
+machine around a prompt that can take minutes: a TUN start is gated so a connect
+click cannot race it onto the same ports, the gate survives a stale error file
+and the 30-second pulse, it gives up after two minutes instead of blocking for
+the session, and a stop still reaches the helper so a cancelled stop prompt
+cannot strand the switch. It prints `SKIP` without quickshell and a Wayland
+session, like the import suite.
+
+```bash
+./tests/test-service-tun.sh
+```
+
+Both are also invoked by `./tests/test-backend.sh`.
+
 ---
 
 ## Uninstall
@@ -620,8 +857,12 @@ stays green headless, and can also be run on its own:
 ```bash
 omarchy plugin disable community.v2ray-client
 omarchy plugin remove community.v2ray-client --yes
+sudo rm -rf /usr/local/lib/omarchy-v2ray    # the TUN helper installed by install-tun
 rm -rf ~/.config/omarchy-v2ray      # your profiles and links — delete only if sure
 ```
+
+TUN's transient state in `/run/omarchy-v2ray-tun` disappears at reboot; run
+`bin/omarchy-v2ray tun-down` first if a tunnel is still up.
 
 ## License
 
