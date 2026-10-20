@@ -146,7 +146,15 @@ Panel {
   // switch is pulsing, and this is why), then the live tunnel, then the reason
   // the switch is disabled, then the offer.
   function tunDetail() {
+    // `tunArming` is only the 30s pulse. The attempt itself can still be
+    // outstanding for up to 120s after that (see tunStartPending), and the panel
+    // must not look idle in that window — every connect click is refused.
     if (v2ray.tunArming) return "Waiting for authorisation…"
+    if (v2ray.tunHandoffPending) {
+      return v2ray.tunStartPending
+        ? "Still waiting for authorisation — check 'omarchy-v2ray tun-status'"
+        : "Stopping TUN — waiting for authorisation"
+    }
     if (v2ray.tunActive) {
       return "All traffic is tunnelled via " + (v2ray.tunIface || "the tun device") +
              ". Turn off to restore normal routing."
@@ -682,11 +690,17 @@ Panel {
                 id: tunSwitch
                 // Bound to the REAL state, never to the click. The helper has to
                 // authenticate first, so a knob that flips immediately and flips
-                // back on a cancelled prompt would be a lie. While arming it
-                // pulses instead; `interactive` is what makes it disabled.
+                // back on a cancelled prompt would be a lie.
+                //
+                // All three "outstanding" signals come from tunStartPending, not
+                // from the 30s pulse: after the pulse the attempt can still be
+                // unconfirmed for another 90s (every connect refused), and a
+                // switch that looks idle then is worse than a slow one. A STOP
+                // that is still unconfirmed is deliberately NOT busy — the user
+                // must be able to turn the tunnel off again.
                 checked: v2ray.tunActive
-                busy: v2ray.tunArming
-                interactive: !v2ray.tunArming && (v2ray.tunCanStart || v2ray.tunActive)
+                busy: v2ray.tunStartPending
+                interactive: !v2ray.tunStartPending && (v2ray.tunCanStart || v2ray.tunActive)
                 foreground: root.foreground
                 accent: Color.accent
                 onToggled: v2ray.tunToggle()
@@ -696,7 +710,7 @@ Panel {
                 // runs, so onStopped has to put it back — a stopped animation
                 // leaves its target halfway (same rule as V2rayActionButton).
                 SequentialAnimation on opacity {
-                  running: v2ray.tunArming
+                  running: v2ray.tunStartPending
                   loops: Animation.Infinite
                   NumberAnimation { from: 1.0; to: 0.35; duration: 450; easing.type: Easing.InOutQuad }
                   NumberAnimation { from: 0.35; to: 1.0; duration: 450; easing.type: Easing.InOutQuad }

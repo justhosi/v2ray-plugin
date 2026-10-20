@@ -64,7 +64,8 @@
 # That invariant is literal: the profile path appears only in the argument list
 # of the USER-side jq (and in the dry-run plan). Every root-side read after the
 # transform — the SOCKS port probe, the engine, the teardown metadata — uses the
-# root-owned config.json that the pipeline produced and validated.
+# invoker-owned (mode 0600) config.json in the root-owned run directory that the
+# pipeline produced and validated.
 #
 # THREAT MODEL / TOCTOU
 # ---------------------
@@ -1032,9 +1033,10 @@ cmd_up() {
 
   snapshot_dns
 
-  # Read the port from the ROOT-OWNED COPY we just built, never from the
-  # caller-owned profile: the profile path is swappable, and this line runs as
-  # root. $CONFIG_FILE is the validated output of the user-side jq pipeline.
+  # Read the port from the INVOKER-OWNED copy we just built (mode 0600, in the
+  # root-owned run directory), never from the caller-owned profile: the profile
+  # path is swappable, and this line runs as root. $CONFIG_FILE is the validated
+  # output of the user-side jq pipeline.
   SOCKS_PORT="$(jq -r '[.inbounds[] | select(.protocol=="socks" or .protocol=="http")][0].port // empty' "$CONFIG_FILE" 2>/dev/null)"
   # ASCII digits: =~ ranges are locale-sensitive (see resolve_invoker).
   [[ $SOCKS_PORT =~ ^[0123456789]+$ ]] || SOCKS_PORT=10808

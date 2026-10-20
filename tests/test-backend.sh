@@ -605,6 +605,23 @@ check_one_json "a state file naming a dead pid emits one JSON object (status)" "
 check "status reports a stale TUN as fully off" jq -e \
   '.tunActive == false and .tunProfileId == "" and .tunIface == "" and .tunSince == 0' <<<"$out"
 
+# A hostile profileId in the root-written file. The id rule lives in
+# read_tun_state, so BOTH readers fail closed by construction rather than each
+# remembering to check — and neither ever echoes the crafted text or joins it
+# into a path.
+jq -n --arg pid "$$" '{profileId:"../../etc/passwd", iface:"tun0", pid:$pid, since:1}' \
+  >"$TUN_STATE"
+out="$(tun_status)"; rc=$?
+check "a hostile profileId exits 0 (tun-status)" test "$rc" -eq 0
+check "a hostile profileId is not active (tun-status)" jq -e \
+  '.ok == true and .active == false and .profileId == ""' <<<"$out"
+out="$(tun_backend_status)"; rc=$?
+check "a hostile profileId exits 0 (status)" test "$rc" -eq 0
+check "a hostile profileId is not active (status)" jq -e \
+  '.tunActive == false and .tunProfileId == "" and .activeId == ""' <<<"$out"
+check "the hostile text is not echoed anywhere (status)" \
+  test "${out#*etc/passwd}" = "$out"
+
 # `status` carries the same information, and must stay one parseable object both
 # with and without a state file.
 rm -f "$TUN_STATE"

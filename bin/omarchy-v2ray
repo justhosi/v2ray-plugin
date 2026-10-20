@@ -496,6 +496,11 @@ read_tun_state() {
   if [[ -n $pid ]] && tun_pid_alive "$pid"; then
     profile="$(jq -r '.profileId' <<<"$parsed")"
     iface="$(jq -r '.iface' <<<"$parsed")"
+    # The id must look like a profile id, exactly as everywhere else in this
+    # script. The file is root-written but its contents are still text; failing
+    # closed HERE is what makes `status` and `tun-status` agree by construction,
+    # and it keeps a crafted id from ever reaching a path join.
+    [[ $profile =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || profile=""
     if [[ -n $profile && -n $iface ]]; then
       jq -c --arg pid "$pid" '. + {active: true, pid: $pid}' <<<"$parsed"
       return 0
@@ -640,7 +645,12 @@ require_tun_helper() {
 # checked helper path. There is no sudo fallback on purpose: sudo does not set
 # PKEXEC_UID, and the helper refuses to guess its identity.
 launch_tun_helper() {
-  local verb="$1" id="${2:-}"
+  # `helper` is set HERE, never inherited from the function above: Bash `local`
+  # is dynamically scoped, so require_tun_helper's copy is already gone when
+  # this line runs. Under `set -u` the expansion then failed inside the FORKED
+  # child (`setsid pkexec … &`), which the parent never notices — it printed
+  # {"ok":true,"launched":true} while nothing had been launched at all.
+  local verb="$1" id="${2:-}" helper="$TUN_HELPER_PATH"
   require_tun_helper
 
   if [[ -n $id ]]; then
@@ -746,6 +756,8 @@ cmd_status() {
   local tun_can_start=false tun_blocked=""
   tun="$(read_tun_state)"
   tun_active="$(jq -r '.active' <<<"$tun")"
+  # read_tun_state validates profileId against the id rule and returns the fully
+  # "off" shape on a bad one, so no path join below can see a crafted id.
   tun_profile="$(jq -r '.profileId' <<<"$tun")"
   tun_iface="$(jq -r '.iface' <<<"$tun")"
   tun_since="$(jq -r '.since' <<<"$tun")"
@@ -1924,11 +1936,6 @@ cmd_install_tun() {
   local dest="$TUN_HELPER_INSTALL_PATH" src owner mode install_cmd
   local dir
   dir="$(dirname -- "$dest")"
-
-  # Defence in depth: the owner/mode checks below would accept any root-owned
-  # file, so the path itself must be the fixed one.
-  [[ $dest == "$TUN_HELPER_INSTALL_PATH" ]] \
-    || emit_error "refusing to install to an unexpected path"
 
   # Never overwrite something that is not already ours to overwrite. A symlink
   # is refused even when it points at a root-owned file, because the link's

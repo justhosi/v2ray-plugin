@@ -88,9 +88,13 @@ build_harness() {
   ln -s "$REPO/Model.js" "$dir/Model.js"
   ln -s "$COMMONS_DIR" "$dir/Commons"
 
-  # The backend double. `status` answers "off" so the panel's own refresh timer
-  # can never be mistaken for one of the scripted replies; `start` sleeps so a
-  # second action really is in flight when the refusal case runs.
+  # The backend double. `status` DELIBERATELY never answers during the run
+  # (sleeps longer than the whole test): every status reply below is applied by
+  # hand, and a real one arriving mid-scenario would confirm or refute state the
+  # scenario is still pretending is in flight — most visibly a stop, where a
+  # fixed "off" reply looks exactly like a successful teardown. `start` sleeps
+  # 0.3s so it is still in flight when tunUp() is called in the same step (which
+  # is synchronous), and gone by the following ticks.
   #
   # Unquoted heredoc: "$dir" is baked in now, and every "$" the double itself
   # expands is escaped.
@@ -98,11 +102,12 @@ build_harness() {
 #!/usr/bin/env bash
 case "\${1:-}" in
   status)
+    sleep 30
     cat "$dir/status.json" 2>/dev/null \\
       || printf '%s\n' '{"ok":true,"installed":true,"engine":"xray","running":false,"listening":false}'
     ;;
   list)     printf '%s\n' '[]' ;;
-  start)    sleep 1; printf '%s\n' '{"ok":true,"id":"p1"}' ;;
+  start)    sleep 0.3; printf '%s\n' '{"ok":true,"id":"p1"}' ;;
   tun-up)   printf '%s\n' '{"ok":true,"launched":true,"needsAuth":true}' ;;
   tun-down) printf '%s\n' '{"ok":true,"launched":true}' ;;
   *)        printf '%s\n' '{"ok":true}' ;;
@@ -226,9 +231,18 @@ Item {
     } else if (n === 8) {
       // One tick of air so the 300ms backstop can fire between ticks.
     } else if (n === 9) {
-      // Two ticks later, the backstop must have cleared the arming.
-      check("the backstop clears arming with no evidence at all", !service.tunArming)
-      check("and says why", service.notice.indexOf("authorisation") !== -1)
+      // Two ticks later, the backstop must have ended the pulse.
+      check("the backstop ends the pulse with no evidence at all", !service.tunArming)
+      // ...and says what really happened. cmd_tun_up stops the proxy engine
+      // before pkexec, so a never-answered prompt leaves the user disconnected.
+      check("and says the proxy connection was stopped",
+            service.notice.indexOf("proxy connection was stopped") !== -1)
+      // NOT an invitation to reconnect: at 30s the gate is still closed, so
+      // "reconnect now" would be a lie. The 120s cap is where that changes.
+      check("and that the attempt is still unconfirmed",
+            service.notice.indexOf("still unconfirmed") !== -1)
+      check("and does not invite a reconnect yet",
+            service.notice.indexOf("reconnect") === -1)
       service.tunArmTimeoutMs = 30000
     } else if (n === 10) {
       // B1 setup: armed for a TUN start.
@@ -269,7 +283,104 @@ Item {
       service.tunUp("p1")
       check("tunUp does not arm when runAction refuses", !service.tunArming)
       check("and leaves the running action alone", service.busy)
+      check("and says another action is running",
+            service.lastError.indexOf("Another action is still running") !== -1)
+    } else if (n === 15 || n === 16 || n === 17) {
+      // Air: the fake `start` from n===14 sleeps for 0.3s on purpose, and
+      // runAction refuses while it is in flight (these ticks are 250ms apart).
     } else if (n === 18) {
+      // THE HAND-OFF OUTLIVES THE PULSE. A prompt that takes longer than the
+      // 30s pulse must still keep proxy connects off the ports; otherwise B1
+      // comes back, just slower. Both windows are shortened so the test does
+      // not sit here for minutes.
+      service.stopTunArming()
+      service.applyStatus(reply({}), 0)
+      service.tunArmTimeoutMs = 200
+      service.tunHandoffTimeoutMs = 30000
+      service.tunUp("p1")
+      check("slow-auth scenario starts a hand-off",
+            service.tunArming && service.tunHandoffPending)
+    } else if (n === 19) {
+      // The pulse has given up (200ms) but nothing has confirmed the hand-off.
+      check("the pulse gives up at its own timeout", !service.tunArming)
+      check("the hand-off gate outlives the pulse", service.tunHandoffPending)
+      service.connect("p1")
+      check("connect is still refused after the pulse expired",
+            service.lastError.indexOf("TUN is starting") !== -1)
+      check("no proxy action was started after the pulse expired",
+            !service.busy && service._pendingRunning === -1 && service.actionRowId === "")
+      service.toggleConnection()
+      check("toggleConnection is still refused after the pulse expired",
+            service.lastError.indexOf("TUN is starting") !== -1 && !service.busy)
+    } else if (n === 20) {
+      // The hard cap: short enough to observe, long enough that it is only a
+      // backstop for a helper that never reports anything at all.
+      service.stopTunArming()
+      service.applyStatus(reply({}), 0)
+      service.tunArmTimeoutMs = 150
+      service.tunHandoffTimeoutMs = 500
+      service.tunUp("p1")
+      check("cap scenario starts a hand-off", service.tunHandoffPending)
+    } else if (n === 21 || n === 22) {
+      // Air for the 500ms cap.
+    } else if (n === 23) {
+      // 750ms after arming: past the 150ms pulse and the 500ms cap.
+      check("the cap clears the hand-off gate", !service.tunHandoffPending)
+      check("the cap says the hand-off was never confirmed",
+            service.notice.indexOf("never confirmed") !== -1
+            && service.notice.indexOf("tun-status") !== -1)
+      service.tunArmTimeoutMs = 30000
+      service.tunHandoffTimeoutMs = 120000
+    } else if (n === 24) {
+      // A status reply that shows the PROXY engine running again means the
+      // user's own explicit action succeeded; the gate must not strand them.
+      service.stopTunArming()
+      service.applyStatus(reply({}), 0)
+      service.tunUp("p1")
+      check("proxy-back scenario starts a hand-off", service.tunHandoffPending)
+      // First, the reply a status query already in flight when the switch was
+      // pressed would produce: the OLD proxy engine. "Again" has not happened.
+      service.applyStatus(reply({ running: true, listening: true, mode: "proxy",
+                                  activeId: "p1" }), 0)
+      check("a stale proxy reply does not drop the gate", service.tunHandoffPending)
+      // Then the engine is observed stopped...
+      service.applyStatus(reply({}), 0)
+      check("the gate survives the proxy engine being stopped", service.tunHandoffPending)
+      // ...and only now is a running proxy engine the user's own doing.
+      service.applyStatus(reply({ running: true, listening: true, mode: "proxy",
+                                  activeId: "p1" }), 0)
+      check("a proxy engine running again clears the gate", !service.tunHandoffPending)
+    } else if (n === 25) {
+      // SHOULD-FIX 3: THE STOP DIRECTION MUST NOT BE STRANDED. TUN is up, the
+      // user turns it off, and the prompt is never answered — no state change,
+      // no error. The gate must not make the off switch dead for two minutes.
+      service.stopTunArming()
+      service.applyStatus(reply({ tunActive: true, tunProfileId: "p1", tunIface: "tun0",
+                                  running: true, listening: true, tunCanStart: false }), 0)
+      service.tunArmTimeoutMs = 30000
+      service.tunDown()
+      check("a stop hand-off starts",
+            service.tunArming && service.tunHandoffPending && service._tunArmTarget === 0)
+      check("a stop hand-off is not a start-pending gate", !service.tunStartPending)
+    } else if (n === 26) {
+      // The launcher has exited by now; the pulse is still up. A second off
+      // click must work: the helper's acquire_teardown_lock serialises it.
+      service.tunArmTimeoutMs = 150
+      service.tunDown()
+      check("tunDown still works while the stop pulse is up",
+            service.busy && service.tunArming)
+    } else if (n === 27) {
+      // Past the pulse, still inside the gate: the case the review described.
+      check("the stop pulse gave up", !service.tunArming)
+      check("the stop gate is still pending", service.tunHandoffPending)
+      service.tunDown()
+      check("tunDown still works while the stop gate is pending", service.busy)
+    } else if (n === 29) {
+      // ...and the switch, which routes through tunToggle, must reach the stop
+      // path rather than the "waiting for authorisation" refusal.
+      service.tunToggle()
+      check("tunToggle still routes to a stop while the gate is pending", service.busy)
+    } else if (n === 32) {
       console.log("TAP summary failures=" + failures)
       Qt.quit()
     }

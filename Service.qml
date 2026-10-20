@@ -112,13 +112,23 @@ Item {
 
   // True between launching a TUN action and the state actually moving. The
   // helper is detached and authenticates in the background, so the switch
-  // pulses instead of flipping optimistically; a polkit prompt that is
-  // cancelled changes NOTHING, which is what the backstop timer below is for.
+  // pulses instead of flipping optimistically. A prompt that is never answered
+  // produces no state change AND no error — and it is not harmless: cmd_tun_up
+  // stops the user's proxy engine BEFORE pkexec, so they are left disconnected.
+  // This flag is only the PULSE (it times out after 30s); the gate that keeps
+  // connects away from the ports is `tunHandoffPending` below.
   property bool tunArming: false
-  // How long the backstop waits. A property rather than a literal so the
+  // A TUN hand-off that has not been confirmed yet. Outlives the pulse on
+  // purpose: polkit can take minutes, and the ports must stay off-limits until
+  // evidence arrives. proxy connect paths are gated on this, not on tunArming.
+  property bool tunHandoffPending: false
+  // How long the pulse waits. A property rather than a literal so the
   // state-machine test can drive the timeout in a second instead of waiting
   // half a minute for it.
   property int tunArmTimeoutMs: 30000
+  // The hard cap on the gate. Longer than any plausible prompt, short enough
+  // that a helper which died silently cannot block connects for the session.
+  property int tunHandoffTimeoutMs: 120000
   // Set when the backend answered needsHelper: the privileged helper is missing
   // (or not root-owned), so the panel offers `installTun()` instead of a prompt
   // that cannot work. Not derived from `tunLastError`, because a missing helper
@@ -131,6 +141,15 @@ Item {
   // failure the file stays non-empty through the whole retry, and "non-empty
   // means this attempt failed" would end the arming before authentication.
   property string _tunErrorAtArm: ""
+  // Set once a status reply has shown something OTHER than the proxy engine as
+  // the live connection — the engine stopped ("off") or TUN took over ("tun").
+  // That is the wider reading the code uses: "Running again" must mean again, so
+  // a status query already in flight when the TUN switch was pressed (still
+  // reporting the old proxy engine) cannot drop the gate in the window it exists
+  // for. Narrowing this to mode === "off" would also work today, but would make
+  // the proxy-back signal dead during a stop hand-off, when "tun" is what the
+  // replies actually say.
+  property bool _tunSawProxyStopped: false
   // The previous tunCanStart, so "became startable" is a transition rather than
   // a state. The post-refusal status reply already says tunCanStart:true (it
   // talks about the engine, not the helper), and clearing the install offer on
@@ -143,6 +162,14 @@ Item {
 
   readonly property bool connected: _pendingRunning === -1 ? (running && listening)
                                                            : (_pendingRunning === 1)
+
+  // A TUN START that has not been confirmed. This — not the generic hand-off
+  // flag — is what gates the proxy connect paths. A hung STOP must not lock the
+  // off switch for two minutes, and while TUN is up the backend already refuses
+  // `start` itself ("TUN mode is on — turn it off from the TUN switch first"), so
+  // the stop direction has a backstop the start direction does not.
+  readonly property bool tunStartPending:
+    (tunArming || tunHandoffPending) && _tunArmTarget === 1
 
   // Absolute path to the backend script, derived from this QML file's URL so
   // it works no matter where the plugin was installed.
@@ -234,6 +261,10 @@ Item {
     if (!installed) return "No xray/v2ray engine installed"
     if (_pendingRunning === 1 && !connected) return "Connecting…"
     if (_pendingRunning === 0 && connected) return "Disconnecting…"
+    // An unconfirmed TUN start is not "Disconnected": the proxy engine was
+    // stopped and the tunnel may still come up. Saying so here is what keeps the
+    // bar tooltip and the panel header honest while the switch is gated.
+    if (tunStartPending && !connected) return "TUN starting — waiting for authorisation"
     if (connected) return "Connected · " + (Model.formatUptime(uptimeSec) || "just now")
     if (running) return "Engine starting…"
     if (profiles.length === 0) return "No servers yet — paste a link below"
@@ -256,18 +287,40 @@ Item {
     onTriggered: root.toast = ""
   }
 
-  // The backstop for a TUN launch that never comes back. A successful launch is
-  // ended by the next status reply, and a refused one ends on its own; the case
-  // this exists for is a polkit prompt that the user cancels — nobody is left to
-  // write a state file OR an error, so without a timeout the switch would pulse
-  // (and refuse clicks) for the rest of the session.
+  // The end of the PULSE, not of the hand-off. A successful launch is ended by
+  // the next status reply, a refused one ends on its own; the case this exists
+  // for is a prompt the user never answers — nobody is left to write a state
+  // file OR an error, so without a timeout the switch would pulse (and refuse
+  // clicks) for the rest of the session.
+  //
+  // It says what actually happened. cmd_tun_up stops the proxy engine before
+  // pkexec, so "TUN did not change" understated it: the user is disconnected.
   Timer {
     id: tunArmTimer
     interval: root.tunArmTimeoutMs
     onTriggered: {
       if (!root.tunArming) return
+      var stopping = root._tunArmTarget === 0
+      root.endTunPulse()
+      root.notice = stopping
+        ? "TUN did not stop — check 'omarchy-v2ray tun-status'"
+        : "The proxy connection was stopped and TUN is still unconfirmed — wait for it, or check 'omarchy-v2ray tun-status'"
+    }
+  }
+
+  // The hard cap on the GATE. The pulse above gives up after 30s; a slow polkit
+  // prompt can still be open then, and letting a connect through would put the
+  // proxy engine back on 10808 exactly as the TUN helper tries to bind it. After
+  // this the gate opens anyway, because a helper that never reported anything
+  // must not block the panel for the rest of the session — and says so.
+  Timer {
+    id: tunHandoffTimer
+    interval: root.tunHandoffTimeoutMs
+    onTriggered: {
+      if (!root.tunHandoffPending) return
+      var what = root._tunArmTarget === 0 ? "TUN stop" : "TUN start"
       root.stopTunArming()
-      root.notice = "TUN did not change — the authorisation prompt may have been cancelled"
+      root.notice = what + " never confirmed — check 'omarchy-v2ray tun-status'"
     }
   }
 
@@ -347,16 +400,24 @@ Item {
                                : ((running && listening) ? "proxy" : "off")))
 
     // A TUN launch is asynchronous, so the switch waits for the state to move
-    // rather than flipping on the click. Arming ends ONLY on evidence about
-    // THIS attempt: the state arrived, or the helper reported something it had
-    // not already said when the attempt was armed. A plain "error is non-empty"
-    // test is wrong here — see _tunErrorAtArm.
-    if (tunArming) {
-      if (_tunArmTarget !== -1 && tunActive === (_tunArmTarget === 1)) {
-        stopTunArming()
-      } else if (tunLastError !== "" && tunLastError !== _tunErrorAtArm) {
-        stopTunArming()
-      }
+    // rather than flipping on the click. The attempt ends ONLY on evidence
+    // about THIS one: the state arrived, the helper reported something it had
+    // not already said when the attempt began, or the proxy engine is running
+    // again (the user reconnected explicitly, so the hand-off never happened).
+    // A plain "error is non-empty" test is wrong here — see _tunErrorAtArm.
+    //
+    // The same evidence ends the PULSE and the GATE: the pulse can have timed
+    // out while polkit was still open, so the gate cannot be a side effect of
+    // the pulse ending.
+    var tunMoved = _tunArmTarget !== -1 && tunActive === (_tunArmTarget === 1)
+    var tunErrored = tunLastError !== "" && tunLastError !== _tunErrorAtArm
+    // "Running AGAIN": only after this attempt has seen the proxy engine stop.
+    // See _tunSawProxyStopped for the in-flight status reply this excludes.
+    if (tunHandoffPending && mode !== "proxy") _tunSawProxyStopped = true
+    var proxyRunning = tunHandoffPending && _tunSawProxyStopped
+                        && mode === "proxy" && running
+    if ((tunArming || tunHandoffPending) && (tunMoved || tunErrored || proxyRunning)) {
+      stopTunArming()
     }
 
     // The helper's own words are the only account of a failed TUN start (nobody
@@ -462,7 +523,10 @@ Item {
 
   function connect(id) {
     if (!id) return
-    if (tunArming) {
+    // The gate outlives the pulse: a slow prompt is exactly when `busy` is false,
+    // the switch looks idle and the backend still has nothing to refuse.
+    // Only a TUN START is gated — see tunStartPending.
+    if (tunStartPending) {
       lastError = tunStartingMessage()
       return
     }
@@ -487,7 +551,7 @@ Item {
     // Same window as connect(): the switch looks idle long before polkit has
     // answered, so refuse here too rather than letting the connect path below
     // start an engine that would fight the one TUN is about to start.
-    if (tunArming) {
+    if (tunStartPending) {
       lastError = tunStartingMessage()
       return
     }
@@ -530,56 +594,116 @@ Item {
   // The privileged half runs detached behind a polkit prompt, so these calls
   // return as soon as the launcher has handed over — `runAction`'s `busy` clears
   // on the child's exit, which is milliseconds later, NOT when the password is
-  // accepted. Anything that has to survive the prompt therefore lives in
-  // `tunArming` and is cleared by the next status reply (or the backstop timer).
+  // accepted. Two windows therefore outlive the call:
+  //
+  //   tunArming          the switch pulses and refuses its own clicks (30s)
+  //   tunHandoffPending  proxy connects stay refused (120s)
+  //
+  // They share one target and one error snapshot, because they are waiting for
+  // the same evidence; only their patience differs.
   //
   // The profile id still goes to runAction as the row id: the list row shows its
   // spinner for the moment the hand-off takes, which is the only feedback before
   // polkit paints its own dialog.
 
-  function armTun(target) {
+  function beginTunHandoff(target) {
     _tunArmTarget = target
     // Snapshot the helper's previous failure BEFORE the attempt starts; see the
     // declaration of _tunErrorAtArm for why an empty test is not enough.
     _tunErrorAtArm = tunLastError
+    // Nothing has been observed about this attempt yet.
+    _tunSawProxyStopped = false
     tunArming = true
+    tunHandoffPending = true
     tunArmTimer.restart()
+    tunHandoffTimer.restart()
   }
 
-  function stopTunArming() {
+  // The pulse only: the gate and its evidence stay for the slower window.
+  function endTunPulse() {
     tunArming = false
+    tunArmTimer.stop()
+  }
+
+  // The whole attempt is over — confirmed, refused, or given up on.
+  function stopTunArming() {
+    endTunPulse()
+    tunHandoffPending = false
     _tunArmTarget = -1
     _tunErrorAtArm = ""
-    tunArmTimer.stop()
+    _tunSawProxyStopped = false
+    tunHandoffTimer.stop()
+  }
+
+  // Another action has the one shared action process. Callers used to return
+  // silently here, which looked like a dead button.
+  function actionBusyMessage() {
+    return "Another action is still running — try again in a moment"
+  }
+
+  function tunWaitMessage() {
+    return "TUN is still waiting for authorisation — check 'omarchy-v2ray tun-status'"
   }
 
   function tunUp(id) {
     if (!id) return
-    // One authorisation at a time: the switch is disabled while arming, but the
-    // `u` shortcut is not, and a second pkexec would only be refused by the
-    // helper's own lock after a second password prompt.
+    // One authorisation at a time. The gate outlives the pulse, so a prompt that
+    // has been open for a minute still blocks a second pkexec (which the
+    // helper's own lock would refuse only after another password prompt).
+    if (tunHandoffPending) {
+      lastError = tunWaitMessage()
+      return
+    }
     if (tunArming) return
     // Arm only when the launcher really started. runAction refuses while another
     // action is in flight, and arming on a refused call would pulse "Waiting for
     // authorisation…" (and swallow every click) for 30 s after nothing happened.
-    if (!runAction(["bash", scriptPath, "tun-up", String(id)], id)) return
-    armTun(1)
+    if (!runAction(["bash", scriptPath, "tun-up", String(id)], id)) {
+      lastError = actionBusyMessage()
+      return
+    }
+    beginTunHandoff(1)
   }
 
   function tunDown() {
-    if (tunArming) return
+    // Deliberately NOT gated on the pending hand-off: while a stop is
+    // unconfirmed, turning the tunnel off again must stay possible. The helper's
+    // acquire_teardown_lock serialises a second teardown, so a second click is
+    // safe. A START in flight is different — a down then would race it.
+    if (tunStartPending) {
+      lastError = tunWaitMessage()
+      return
+    }
+    // No `if (tunArming) return` here: during a STOP pulse the switch must keep
+    // working, and the launcher has already exited by the time a human can
+    // click. A START pulse was caught above.
     // Same rule as tunUp: arm only once the launcher has actually started.
-    if (!runAction(["bash", scriptPath, "tun-down"], "")) return
-    armTun(0)
+    if (!runAction(["bash", scriptPath, "tun-down"], "")) {
+      lastError = actionBusyMessage()
+      return
+    }
+    beginTunHandoff(0)
   }
 
   // What the panel's TUN switch and the `u` shortcut call. Turning TUN ON needs
   // a profile: the same "last one, else the autostart pick, else the only one"
   // rule the proxy switch uses, so a single-server setup needs no choices.
   function tunToggle() {
-    if (tunArming) return
+    // Off first, and without the pending gate: if TUN is still up (a stop the
+    // prompt never answered), the switch must keep working.
     if (tunActive) {
       tunDown()
+      return
+    }
+    if (tunStartPending) {
+      lastError = tunWaitMessage()
+      return
+    }
+    if (tunArming) return
+    if (tunHandoffPending) {
+      // TUN is down but a STOP is still unconfirmed: do not start a second
+      // helper on top of it.
+      lastError = tunWaitMessage()
       return
     }
     if (!tunCanStart) {

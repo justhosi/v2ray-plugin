@@ -537,9 +537,8 @@ if jq -e '.ok == true' <<<"$out" >/dev/null 2>&1; then
 else
   # A refusal is only excusable when it is a fact about THIS machine — a
   # destination left behind by a real install that this user may not overwrite.
-  # Anything else (notably "refusing to install to an unexpected path") means the
-  # destination stopped being the constant, which is exactly what this case
-  # exists to catch, so it must FAIL rather than quietly skip.
+  # Any other refusal means install-tun stopped doing its job, which is what
+  # this case exists to catch, so it must FAIL rather than quietly skip.
   refusal="$(jq -r '.error // ""' <<<"$out")"
   if [[ $refusal == *"not owned by root"* || $refusal == *"group- or world-writable"* \
         || $refusal == *"symlink"* || $refusal == *"non-directory"* \
@@ -549,6 +548,63 @@ else
     printf '  FAIL install-tun refused for a reason that is not a local condition: %s\n' "${refusal:-no JSON}"
     failures=$((failures + 1))
   fi
+fi
+
+# =============================================================================
+echo
+echo "case 12: the launcher really hands the helper to pkexec"
+# THE BUG THIS CATCHES: launch_tun_helper expanded $helper without ever setting
+# it, relying on require_tun_helper's `local`. Bash locals are dynamically
+# scoped, so it was gone; under `set -u` the expansion failed inside the FORKED
+# child of `setsid pkexec … &`, and the parent — which never waits for that
+# child — still printed {"ok":true,"launched":true}. Every TUN click stopped the
+# proxy engine (cmd_tun_up does that first), launched nothing, and left the
+# panel gating connects over a hand-off that could never produce evidence.
+#
+# No root is needed to see it: the pre-flight only wants a root-owned,
+# non-symlink executable, and a recording pkexec on PATH proves whether anything
+# was actually launched. /usr/bin/true qualifies on a normal system, and the
+# recorder never executes it, so nothing privileged happens either way.
+HELPER_BIN=/usr/bin/true
+helper_ok=true
+[[ -f $HELPER_BIN && -x $HELPER_BIN && ! -L $HELPER_BIN ]] || helper_ok=false
+[[ "$(stat -c '%u' "$HELPER_BIN" 2>/dev/null)" == 0 ]] || helper_ok=false
+helper_mode="$(stat -c '%a' "$HELPER_BIN" 2>/dev/null)"
+[[ -n $helper_mode ]] && (( (8#$helper_mode & 8#022) == 0 )) || helper_ok=false
+
+if [[ $helper_ok != true ]]; then
+  # Deliberately not a SKIP: this case must run as an ordinary user, and on a
+  # machine where $HELPER_BIN is not root-owned 0755 the premise is broken.
+  printf '  FAIL %s is not a root-owned 0755 non-symlink, so this case cannot run as designed\n' "$HELPER_BIN"
+  failures=$((failures + 1))
+else
+  # No TUN state, or tun-up refuses with "already active" before launching.
+  rm -f "$RUN/state.json" "$WORK/pkexec.args"
+
+  out="$(OMARCHY_V2RAY_TUN_HELPER="$HELPER_BIN" "$BACKEND" tun-up "$ID" 2>"$WORK/launch.err")"
+  # The launch is detached, so wait for the recording to appear; the assertion is
+  # on its bytes, never on when it landed.
+  for _ in $(seq 1 40); do
+    [[ -s "$WORK/pkexec.args" ]] && break
+    sleep 0.05
+  done
+  check "tun-up reports launched" jq -e '.ok == true and .launched == true' <<<"$out"
+  check "tun-up printed no shell error" test ! -s "$WORK/launch.err"
+  check "tun-up really ran the recording pkexec" test -s "$WORK/pkexec.args"
+  check "pkexec received exactly the helper, 'up' and the id" \
+    test "$(cat "$WORK/pkexec.args")" = "$HELPER_BIN up $ID"
+
+  rm -f "$WORK/pkexec.args"
+  out="$(OMARCHY_V2RAY_TUN_HELPER="$HELPER_BIN" "$BACKEND" tun-down 2>"$WORK/launch.err")"
+  for _ in $(seq 1 40); do
+    [[ -s "$WORK/pkexec.args" ]] && break
+    sleep 0.05
+  done
+  check "tun-down reports launched" jq -e '.ok == true and .launched == true' <<<"$out"
+  check "tun-down printed no shell error" test ! -s "$WORK/launch.err"
+  check "tun-down really ran the recording pkexec" test -s "$WORK/pkexec.args"
+  check "pkexec received exactly the helper and 'down'" \
+    test "$(cat "$WORK/pkexec.args")" = "$HELPER_BIN down"
 fi
 
 # =============================================================================
