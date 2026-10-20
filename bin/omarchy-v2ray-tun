@@ -80,11 +80,14 @@
 #     nothing else (no file access, no process control, no root shell);
 #   * the helper never reads the config back TO DECIDE WHAT TO TEAR DOWN —
 #     teardown uses the recorded `routes` file and the state file (iface, DNS,
-#     pid), not the config. The one later read, apply_routes extracting the
-#     server's address for its /32 and /128 exemptions, passes the value
-#     through the same validation as profile-derived text before it reaches
-#     `ip`; a swapped file can only steer routing for an engine the user
-#     already controls.
+#     pid), not the config. The root-side reads that DO happen after the
+#     transform change no authority: pin_server_address and
+#     bind_direct_outbound read it only to rewrite the same file the user
+#     already owns (temp file, 0600, mv), and add_server_routes (called via
+#     apply_routes) extracts the server's address for its /32 and /128
+#     exemptions — validated the same way as profile-derived text before it
+#     reaches `ip`; a swapped file can only steer routing for an engine the
+#     user already controls.
 #
 # The alternative — a config the user cannot write — is impossible while the
 # engine runs as the user. The file is therefore deleted as soon as the engine
@@ -741,6 +744,10 @@ pin_server_address() {
   # Same rewrite discipline as build_tun_config: temp file 0600 in the root-owned
   # run directory, chowned to the invoking user, renamed into place. The config
   # is never logged; the HOSTNAME (not a secret) and the pinned address are.
+  # The 0600-from-the-first-byte part is umask work that build_tun_config set
+  # process-wide; it is stated HERE too, so this rewrite keeps its own guard
+  # even if the call order changes again.
+  umask 077
   local addr host ip4="" ip6="" picked="" tmp
   addr="$(server_address_from_file "$CONFIG_FILE")"
   [[ -n $addr ]] || { helper_log "pin: the config has no usable proxy address"; return 1; }
@@ -804,16 +811,24 @@ bind_direct_outbound() {
   # network), and teardown would then delete a route the helper did not
   # create.
   #
-  # DOCUMENTED LIMITATION: on a split-interface dual-stack host this pins IPv6
-  # direct traffic to the IPv4 uplink's device too. A direct dial that needed
-  # the v6 uplink's own device still leaves the machine — the device exists —
-  # just through a different link than a per-family bind would pick.
+  # DOCUMENTED LIMITATION, the part users will actually hit: a bound socket's
+  # route lookup is restricted to the bound device — so on a split-interface
+  # host an IPv6 direct dial bound to the IPv4 uplink's device FAILS
+  # (ENETUNREACH; the bind does not make that device v6-capable), and any
+  # direct dial the kernel's table would have sent out a DIFFERENT device (a
+  # second NIC, a VPN interface, a container bridge) is forced onto the default
+  # uplink and fails there too. The loop protection is stronger than a route a
+  # direct dial could follow; this is its price.
   #
   # Same rewrite discipline as build_tun_config / pin_server_address: temp file
   # in $RUN_DIR, 0600 from the first byte, chowned to the invoking user,
   # renamed into place. streamSettings and sockopt are CREATED when absent; an
   # existing sockopt keeps its other keys (mark, and so on) and only gains the
-  # interface. cmd_up detects the uplink before calling this; the guard is
+  # interface. Like pin_server_address, this restates umask 077 (build_tun_config
+  # set it process-wide) so the 0600-from-the-first-byte promise is this
+  # function's own, not an inheritance that a call-order change could strip.
+  umask 077
+  # cmd_up detects the uplink before calling this; the guard is
   # what refuses a start that somehow reached here without one, rather than
   # binding the sockets to an empty interface name.
   [[ -n $UPLINK_DEV ]] \
