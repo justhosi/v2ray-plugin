@@ -39,9 +39,23 @@
 # The two files are split on purpose: the config holds the secret UUID, the
 # meta file holds everything safe to show in the UI (and to copy/paste).
 #
+# TUN mode is a *system-wide* tunnel: it needs a tun device, which needs
+# CAP_NET_ADMIN, so the helper that creates it is privileged. Its state therefore
+# lives outside this tree, in a file that helper writes and this script only ever
+# READS (nothing here gains privileges):
+#
+#   /run/omarchy-v2ray-tun/state.json
+#       {"profileId":"...","iface":"...","pid":"1234","since":1700000000}
+#
+# The helper writes it atomically; we treat every field as untrusted text and
+# degrade to "not active" on anything we cannot read (see read_tun_state). The
+# path is overridable with OMARCHY_V2RAY_TUN_STATE, so tests can point it at a
+# temp dir without touching /run — the same reason OMARCHY_V2RAY_HOME exists.
+#
 # SUBCOMMANDS
 # -----------
 #   status              Engine/profile/connection state as one JSON object.
+#   tun-status          Read-only TUN state: can it start here, is it active.
 #   list                Every imported profile as a JSON array.
 #   import              Read {id,meta,config} JSON on STDIN, write a profile.
 #                       (stdin only, on purpose: an argv or environment payload
@@ -89,6 +103,9 @@ LOG_FILE="$STATE_DIR/engine.log"
 ACTIVE_FILE="$STATE_DIR/active.id"
 STARTED_FILE="$STATE_DIR/started.epoch"
 AUTOSTART_FILE="$STATE_DIR/autostart.id"
+# The TUN state file is NOT under CONFIG_DIR: a root helper writes it (see the
+# LAYOUT ON DISK note), and it must be readable without touching the user tree.
+TUN_STATE_FILE="${OMARCHY_V2RAY_TUN_STATE:-/run/omarchy-v2ray-tun/state.json}"
 
 # Default local proxy ports. The panel can override these per import through the
 # widget settings; these are only the fallback.
@@ -244,6 +261,25 @@ require_capable_engine() {
 }
 
 # -----------------------------------------------------------------------------
+# tun_engine_reason ENGINE — the user-facing fix when the installed core cannot
+# do TUN mode, or nothing at all when it can.
+# -----------------------------------------------------------------------------
+# WHY THIS IS A HARD REQUIREMENT: v2ray-core has no `tun` inbound. Its config
+# parser does not reject the key — it simply has nowhere to put it — so a TUN
+# config fed to v2ray starts an ordinary local proxy and the system-wide tunnel
+# silently never exists. xray implements the inbound natively (verified against
+# xray 26.3.27), so the only honest answer on v2ray is the package to install.
+tun_engine_reason() {
+  local engine="${1:-}"
+  [[ $engine == "xray" ]] && return 0
+  if [[ -z $engine ]]; then
+    printf '%s' "TUN needs the xray core, and no engine is installed: omarchy pkg aur add xray"
+  else
+    printf '%s' "TUN needs the xray core (v2ray has no tun inbound): omarchy pkg aur add xray"
+  fi
+}
+
+# -----------------------------------------------------------------------------
 # probe_cert HOST PORT SNI — "subject=... issuer=..." for the certificate a TLS
 # server presents for that SNI, or an empty string if openssl is missing / the
 # connection failed.
@@ -339,6 +375,106 @@ read_pid() {
     rm -f "$PID_FILE"
     echo ""
   fi
+}
+
+# -----------------------------------------------------------------------------
+# tun_pid_alive PID — true when /proc/PID exists.
+# -----------------------------------------------------------------------------
+# NOT `kill -0`. Bash collapses EPERM and ESRCH into exit 1, so an unprivileged
+# caller cannot distinguish "no such process" from "exists but owned by someone
+# else". The privileged slice execs the engine as the INVOKING user with only
+# CAP_NET_ADMIN, so /proc/<pid> will exist and remain readable to that user; the
+# TUN state's liveness probe must therefore test existence there and must not
+# rely on signalability.
+tun_pid_alive() {
+  [[ -n ${1:-} && -d /proc/$1 ]]
+}
+
+# -----------------------------------------------------------------------------
+# read_tun_state — one compact JSON object describing the TUN tunnel, always
+# parseable and never an error.
+# -----------------------------------------------------------------------------
+# The file is written by the root helper of a later slice (creating a tun device
+# needs CAP_NET_ADMIN) and is only ever read here. Every field in it is untrusted
+# text: the file lives in /run, it may be half-written at the instant we sample
+# it, and it outlives the process it names.
+#
+# Therefore this function has exactly ONE failure mode, "not active". A missing
+# file, an unreadable file, malformed JSON, a field of the wrong type, a partial
+# write and a pid that no longer exists all return the same empty object with
+# active:false. Nothing here exits, prints a diagnostic, or lets jq's stderr
+# reach the caller — a `status` call must not turn into a wall of parse errors
+# because a stale state file happens to exist.
+#
+# "Not active" is one SHAPE, not merely a flag: whenever active is false,
+# profileId, iface, pid and since are all emptied/zeroed too. That single rule
+# lives here so `status` and `tun-status` cannot disagree, and so a stale profile
+# name or interface is never painted next to active:false.
+#
+# active also requires profileId and iface, not just a live pid: a file carrying
+# only a pid is a partial write, and reporting it as connected would paint a
+# tunnel the UI can neither name nor stop. `since` is allowed to be absent (0),
+# because a running tunnel whose start time is unknown is still running.
+#
+# The file must hold exactly ONE JSON document. `jq -c` prints one line per
+# input document, so a file with two concatenated objects (an append-style
+# writer, a doubled write, JSONL) used to yield a multi-line value; callers then
+# failed `jq --argjson` on it, printing nothing at all to stdout while still
+# exiting 0. `jq -s` plus the `length != 1` test folds zero, one and many
+# documents into the one failure mode above.
+read_tun_state() {
+  local off='{"active":false,"profileId":"","iface":"","since":0,"pid":""}'
+  [[ -f $TUN_STATE_FILE ]] || { printf '%s' "$off"; return 0; }
+
+  local parsed
+  parsed="$(jq -sc '
+    if length != 1 then empty
+    elif (.[0] | type) != "object" then empty
+    else .[0] |
+      {
+        profileId: ((.profileId // "") | if type == "string" then . else "" end),
+        iface: ((.iface // "") | if type == "string" then . else "" end),
+        pid: ((.pid // "") | if type == "number" then tostring
+                          elif type == "string" then .
+                          else "" end),
+        since: ((.since // 0) | if type == "number"
+                               then (floor | if . < 0 then 0 else . end)
+                               else 0 end)
+      }
+    end
+  ' "$TUN_STATE_FILE" 2>/dev/null)" || parsed=""
+
+  # jq -c emits at most one line per output document and the filter above emits
+  # at most one document, so this is defence in depth: a newline here would
+  # break the --argjson callers, so drop the value rather than let it through.
+  [[ $parsed != *$'\n'* ]] || parsed=""
+
+  # A file that is not exactly one JSON object (or a value just dropped above)
+  # produces nothing usable, so "unusable" and "absent" deliberately share one
+  # return value.
+  [[ -n $parsed ]] || { printf '%s' "$off"; return 0; }
+
+  local pid profile="" iface=""
+  pid="$(jq -r '.pid' <<<"$parsed")"
+  # Only a plain decimal pid >= 1 can name a process. 0 is rejected explicitly:
+  # `kill -0 0` checks the caller's own process group and would report a tunnel
+  # that never existed. Anything else — empty, "12a", two pids joined by a
+  # newline — is dropped rather than handed to kill.
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || pid=""
+
+  if [[ -n $pid ]] && tun_pid_alive "$pid"; then
+    profile="$(jq -r '.profileId' <<<"$parsed")"
+    iface="$(jq -r '.iface' <<<"$parsed")"
+    if [[ -n $profile && -n $iface ]]; then
+      jq -c --arg pid "$pid" '. + {active: true, pid: $pid}' <<<"$parsed"
+      return 0
+    fi
+  fi
+
+  # ONE "off" shape, applied here for every caller. See the note above: a dead
+  # pid, a missing name, a wrong-typed field and a malformed file all land on
+  # this exact object.
+  printf '%s' "$off"
 }
 
 # free_port — find an unused local TCP port for a throwaway engine.
@@ -444,6 +580,30 @@ cmd_status() {
     active_name="$(jq -r '.name // ""' "$(meta_path "$active_id")" 2>/dev/null)"
   fi
 
+  # TUN is a second, system-wide tunnel. Its state comes from the root-written
+  # file (read_tun_state never fails), and `tunCanStart` is the panel's gate for
+  # offering the switch: it repeats the two conditions the privileged slice will
+  # enforce, so the UI can explain the block instead of offering a button that
+  # cannot work. An already-active tunnel is its own block — the reason to say no
+  # is not a missing package.
+  local tun tun_active=false tun_profile="" tun_iface="" tun_since=0
+  local tun_can_start=false tun_blocked=""
+  tun="$(read_tun_state)"
+  tun_active="$(jq -r '.active' <<<"$tun")"
+  tun_profile="$(jq -r '.profileId' <<<"$tun")"
+  tun_iface="$(jq -r '.iface' <<<"$tun")"
+  tun_since="$(jq -r '.since' <<<"$tun")"
+
+  if [[ $tun_active == true ]]; then
+    tun_blocked="TUN is already active"
+  else
+    tun_blocked="$(tun_engine_reason "$engine")"
+    [[ -z $tun_blocked ]] && tun_can_start=true
+    # Nothing is cleared here on purpose: read_tun_state already returns every
+    # field emptied/zeroed whenever active is false, and that is the single
+    # "off means off" rule both `status` and `tun-status` share.
+  fi
+
   jq -n \
     --argjson installed "$installed" \
     --arg engine "$engine" \
@@ -457,6 +617,12 @@ cmd_status() {
     --argjson uptimeSec "$uptime" \
     --arg autostartId "$autostart" \
     --arg logTail "$(last_log_lines 3)" \
+    --argjson tunActive "$tun_active" \
+    --arg tunProfileId "$tun_profile" \
+    --arg tunIface "$tun_iface" \
+    --argjson tunSince "$tun_since" \
+    --argjson tunCanStart "$tun_can_start" \
+    --arg tunBlockedReason "$tun_blocked" \
     '{
        ok: true,
        installed: $installed,
@@ -470,7 +636,49 @@ cmd_status() {
        httpPort: (if $httpPort == "" then null else ($httpPort | tonumber) end),
        uptimeSec: $uptimeSec,
        autostartId: $autostartId,
-       logTail: $logTail
+       logTail: $logTail,
+       tunActive: $tunActive,
+       tunProfileId: $tunProfileId,
+       tunIface: $tunIface,
+       tunSince: $tunSince,
+       tunCanStart: $tunCanStart,
+       tunBlockedReason: $tunBlockedReason
+     }'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: tun-status
+# -----------------------------------------------------------------------------
+# A pure read, like `status`: does this machine have a core that can do TUN, and
+# is a TUN tunnel already up according to the root-written state file? It starts
+# and stops nothing, probes nothing, and needs no privileges. That is the whole
+# point of this slice: the privileged half (`tun-up` / `tun-down`) does not exist
+# yet, and nothing here may quietly grow a way to gain root.
+cmd_tun_status() {
+  local engine available=false reason=""
+  engine="$(engine_bin)"
+  reason="$(tun_engine_reason "$engine")"
+  [[ -z $reason ]] && available=true
+
+  local tun
+  tun="$(read_tun_state)"
+
+  jq -n \
+    --argjson available "$available" \
+    --arg engine "$engine" \
+    --arg reason "$reason" \
+    --argjson tun "$tun" \
+    '{
+       ok: true,
+       available: $available,
+       active: $tun.active,
+       profileId: $tun.profileId,
+       iface: $tun.iface,
+       since: $tun.since,
+       pid: $tun.pid,
+       engine: $engine,
+       reason: $reason
      }'
   exit 0
 }
@@ -1391,6 +1599,7 @@ cmd_reveal() {
 # -----------------------------------------------------------------------------
 case "${1:-}" in
   status)         cmd_status ;;
+  tun-status)     cmd_tun_status ;;
   list)           cmd_list ;;
   import)         shift; cmd_import "$@" ;;
   remove)         shift; cmd_remove "$@" ;;

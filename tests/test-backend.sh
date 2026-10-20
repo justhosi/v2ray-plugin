@@ -477,6 +477,205 @@ check "a world-listable state dir is repaired to 0700"    test "$(stat -c %a "$P
 
 # =============================================================================
 echo
+echo "case 0e: TUN is observed, never started"
+# TUN mode is a system-wide tunnel and needs CAP_NET_ADMIN, so the half that
+# creates it is privileged and does not exist yet. This slice only teaches the
+# backend to READ the root-written state file and to answer "can TUN start
+# here?"; these cases pin that it is a pure query: always valid JSON, never a
+# crash, and always "not active" when the file cannot be trusted.
+TUN_STATE="$WORK/tun/state.json"
+mkdir -p "$WORK/tun"
+tun_status() { OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" "$BACKEND" tun-status 2>/dev/null; }
+tun_backend_status() { OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" "$BACKEND" status 2>/dev/null; }
+
+# check_one_json <description> <stdout>: stdout is non-empty and parses as
+# exactly ONE JSON document (pretty-printed is fine). The blocker this guards
+# against answered with EMPTY stdout and exit 0, so "exit 0" alone is not an
+# assertion.
+check_one_json() {
+  local what="$1" text="$2"
+  if [[ -n $text ]] \
+     && jq -es 'length == 1 and (.[0] | type) == "object"' >/dev/null 2>&1 <<<"$text"; then
+    printf '  ok   %s\n' "$what"
+  else
+    printf '  FAIL %s\n        stdout was: %s\n' "$what" "${text:-<empty>}"
+    failures=$((failures + 1))
+  fi
+}
+
+# No state file is the normal case on a machine that never started TUN mode.
+out="$(tun_status)"
+check "tun-status without a state file answers valid JSON" jq -e '.ok == true' <<<"$out"
+check "and reports TUN as not active" jq -e '.active == false' <<<"$out"
+check "the fake engine is xray, so TUN is available" jq -e '.available == true and .engine == "xray"' <<<"$out"
+check "an available core needs no reason" jq -e '.reason == ""' <<<"$out"
+
+# A well-formed file is passed through. $$ is a live pid — the test shell itself —
+# which is exactly what the liveness check must accept.
+jq -n --arg id "$ID" --arg pid "$$" \
+  '{profileId:$id, iface:"tun0", pid:$pid, since:1700000000}' >"$TUN_STATE"
+out="$(tun_status)"
+check "a live, well-formed state is reported active" jq -e '.active == true' <<<"$out"
+check "its profile id is passed through" jq -e --arg id "$ID" '.profileId == $id' <<<"$out"
+check "its interface is passed through" jq -e '.iface == "tun0"' <<<"$out"
+check "its start time is passed through" jq -e '.since == 1700000000' <<<"$out"
+check "its pid is passed through as a string" jq -e --arg pid "$$" '.pid == $pid' <<<"$out"
+
+# A half-written file is not a tunnel. The failure must stay silent on stdout
+# (the caller always parses it) and on stderr (a wall of jq errors is not a
+# user-facing message).
+printf '%s' '{"profileId":' >"$TUN_STATE"
+out="$(OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" "$BACKEND" tun-status 2>"$WORK/tun/err")"
+check "malformed JSON is not active, and still ok" jq -e '.ok == true and .active == false' <<<"$out"
+check "malformed JSON produces no jq noise on stderr" test ! -s "$WORK/tun/err"
+
+# Missing fields degrade instead of failing: no pid means no tunnel to report.
+printf '%s' '{"profileId":"half"}' >"$TUN_STATE"
+out="$(tun_status)"
+check "a state file missing its pid is not active" jq -e '.ok == true and .active == false' <<<"$out"
+
+# A state file holding TWO complete objects used to break both readers: `jq -c`
+# emitted one line per document, the resulting multi-line value failed
+# `--argjson` on stderr, and stdout was left EMPTY with exit 0. Both commands
+# must still answer with exactly one parseable object and report TUN off.
+printf '%s\n%s\n' \
+  '{"profileId":"a","iface":"tun0","pid":1,"since":1}' \
+  '{"profileId":"b","iface":"tun1","pid":1,"since":2}' >"$TUN_STATE"
+out="$(tun_status)"; rc=$?
+check "a two-document state file exits 0 (tun-status)" test "$rc" -eq 0
+check_one_json "a two-document state file emits one JSON object (tun-status)" "$out"
+check "and reports TUN off with no stale fields (tun-status)" jq -e \
+  '.active == false and .profileId == "" and .iface == "" and .since == 0 and .pid == ""' <<<"$out"
+
+out="$(tun_backend_status)"; rc=$?
+check "a two-document state file exits 0 (status)" test "$rc" -eq 0
+check_one_json "a two-document state file emits one JSON object (status)" "$out"
+check "and reports TUN off with no stale fields (status)" jq -e \
+  '.tunActive == false and .tunProfileId == "" and .tunIface == "" and .tunSince == 0' <<<"$out"
+
+# pid 0 is not a process: `kill -0 0` (and /proc/0) refer to the caller's own
+# process group, which used to make this look like a live tunnel.
+jq -n --arg id "$ID" '{profileId:$id, iface:"tun0", pid:0, since:1700000000}' >"$TUN_STATE"
+out="$(tun_status)"; rc=$?
+check "pid 0 exits 0 (tun-status)" test "$rc" -eq 0
+check_one_json "pid 0 still emits one JSON object (tun-status)" "$out"
+check "pid 0 is not a live tunnel (tun-status)" jq -e \
+  '.active == false and .pid == "" and .profileId == ""' <<<"$out"
+out="$(tun_backend_status)"; rc=$?
+check "pid 0 exits 0 (status)" test "$rc" -eq 0
+check_one_json "pid 0 still emits one JSON object (status)" "$out"
+check "pid 0 is not a live tunnel (status)" jq -e \
+  '.tunActive == false and .tunProfileId == "" and .tunIface == "" and .tunSince == 0' <<<"$out"
+
+# An empty or whitespace-only file is not a tunnel, and must not stop either
+# command from answering.
+for flavour in empty whitespace; do
+  if [[ $flavour == empty ]]; then
+    : >"$TUN_STATE"
+  else
+    printf ' \n\t\n' >"$TUN_STATE"
+  fi
+  out="$(tun_status)"; rc=$?
+  check "a $flavour state file exits 0 (tun-status)" test "$rc" -eq 0
+  check_one_json "a $flavour state file emits one JSON object (tun-status)" "$out"
+  check "a $flavour state file is not active (tun-status)" jq -e '.active == false' <<<"$out"
+  out="$(tun_backend_status)"; rc=$?
+  check "a $flavour state file exits 0 (status)" test "$rc" -eq 0
+  check_one_json "a $flavour state file emits one JSON object (status)" "$out"
+  check "a $flavour state file is not active (status)" jq -e '.tunActive == false' <<<"$out"
+done
+
+# A pid that has exited is the stale-file case: it must not keep the UI painted
+# as connected. It is made dead here (and reaped, so /proc cannot see it)
+# rather than guessed. Both commands must agree on the fully-off shape.
+( exit 0 ) &
+dead_pid=$!
+wait "$dead_pid" 2>/dev/null
+jq -n --arg id "$ID" --arg pid "$dead_pid" \
+  '{profileId:$id, iface:"tun0", pid:$pid, since:1700000000}' >"$TUN_STATE"
+out="$(tun_status)"; rc=$?
+check "a state file naming a dead pid exits 0 (tun-status)" test "$rc" -eq 0
+check_one_json "a state file naming a dead pid emits one JSON object (tun-status)" "$out"
+check "a state file naming a dead pid is fully off (tun-status)" jq -e \
+  '.ok == true and .active == false and .profileId == "" and .iface == ""
+   and .since == 0 and .pid == ""' <<<"$out"
+out="$(tun_backend_status)"; rc=$?
+check "a state file naming a dead pid exits 0 (status)" test "$rc" -eq 0
+check_one_json "a state file naming a dead pid emits one JSON object (status)" "$out"
+check "status reports a stale TUN as fully off" jq -e \
+  '.tunActive == false and .tunProfileId == "" and .tunIface == "" and .tunSince == 0' <<<"$out"
+
+# `status` carries the same information, and must stay one parseable object both
+# with and without a state file.
+rm -f "$TUN_STATE"
+out="$(OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" "$BACKEND" status 2>/dev/null)"
+check "status stays valid JSON with no TUN state" jq -e '.ok == true' <<<"$out"
+check "status carries every TUN field" jq -e \
+  'has("tunActive") and has("tunProfileId") and has("tunIface") and has("tunSince")
+   and has("tunCanStart") and has("tunBlockedReason")' <<<"$out"
+check "with no state, TUN is off and startable" jq -e \
+  '.tunActive == false and .tunProfileId == "" and .tunIface == ""
+   and .tunSince == 0 and .tunCanStart == true and .tunBlockedReason == ""' <<<"$out"
+check "the pre-existing status fields are untouched" jq -e \
+  '.installed == true and .engine == "xray" and .running == false
+   and .pid == "" and .autostartId == ""' <<<"$out"
+
+jq -n --arg id "$ID" --arg pid "$$" \
+  '{profileId:$id, iface:"tun0", pid:$pid, since:1700000000}' >"$TUN_STATE"
+out="$(OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" "$BACKEND" status 2>/dev/null)"
+check "status reports the active TUN tunnel" jq -e --arg id "$ID" \
+  '.ok == true and .tunActive == true and .tunProfileId == $id
+   and .tunIface == "tun0" and .tunSince == 1700000000' <<<"$out"
+check "an active TUN is not startable again" jq -e '.tunCanStart == false' <<<"$out"
+
+# v2ray-core has no tun inbound, so TUN must be refused even with a healthy
+# engine installed — and the refusal has to name the package, not just say no.
+#
+# The call is given a MINIMAL PATH on purpose: this machine may well have xray
+# installed (that is the normal case for this plugin), and leaving /usr/bin on
+# PATH would let the real xray answer for the wrong engine. The tools `status`
+# shells out to are linked in and a fake v2ray shadows any real one, so the only
+# core visible for these calls is v2ray. FAKEBIN itself is untouched: every other
+# case depends on the xray double in it.
+V2RAYBIN="$WORK/bin-v2ray"
+mkdir -p "$V2RAYBIN"
+cat >"$V2RAYBIN/v2ray" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  version) echo "v2ray 0.0.0-test (test double)"; exit 0 ;;
+esac
+sleep 4
+SH
+chmod +x "$V2RAYBIN/v2ray"
+# Tools `status` shells out to: extend this list rather than delete it when
+# status grows another external command, or this case fails for the wrong reason.
+for tool in bash env jq tr date tail awk sed grep mkdir chmod rm cat head cut seq sleep; do
+  src="$(command -v "$tool" 2>/dev/null)" && ln -sf "$src" "$V2RAYBIN/$tool"
+done
+cp "$FAKEBIN/ss" "$FAKEBIN/curl" "$V2RAYBIN/"
+NOXRAY_PATH="$V2RAYBIN"
+
+out="$(PATH="$NOXRAY_PATH" OMARCHY_V2RAY_TUN_STATE="$WORK/tun/none.json" "$BACKEND" tun-status 2>/dev/null)"
+check "with only v2ray installed, TUN is unavailable" jq -e \
+  '.ok == true and .available == false and .engine == "v2ray"' <<<"$out"
+check_contains "the unavailability names the fix" "$(jq -r '.reason' <<<"$out")" \
+  "omarchy pkg aur add xray"
+
+out="$(PATH="$NOXRAY_PATH" OMARCHY_V2RAY_TUN_STATE="$WORK/tun/none.json" "$BACKEND" status 2>/dev/null)"
+check "with only v2ray installed, tunCanStart is false" jq -e \
+  '.ok == true and .tunCanStart == false and .tunActive == false' <<<"$out"
+check_contains "and status names the same fix" "$(jq -r '.tunBlockedReason' <<<"$out")" \
+  "omarchy pkg aur add xray"
+
+# The privileged half is a LATER slice. A stub that silently succeeded would let
+# the UI believe TUN could be switched and would hide the missing work.
+for verb in tun-up tun-down; do
+  out="$("$BACKEND" "$verb" 2>/dev/null)"
+  check "$verb does not exist yet" jq -e '.ok == false and (.error | contains("unknown subcommand"))' <<<"$out"
+done
+
+# =============================================================================
+echo
 echo "case 1: the server refuses the REALITY handshake"
 # The engine says the same thing on every retry, with a different timestamp.
 printf '%s\n' \
