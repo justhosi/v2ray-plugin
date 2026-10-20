@@ -245,6 +245,7 @@ if [[ $HAVE_XRAY == true ]]; then
   # and no direct-range route lines at all. The fixture profile's outbound is
   # literal, so there is no pin step to show — the same no-op the real run
   # performs.
+  #
   # The plan must show the ACTUAL bind program, not merely some sockopt
   # mention: the constant is one definition with two call sites (bind and
   # plan), so the planned program literally contains `.streamSettings.sockopt`
@@ -332,6 +333,18 @@ check "the engine is launched with the transition-lock fd closed (9>&-)" \
   grep -q '9>&-' "$WORK/start_engine.body"
 check "the lock-fd close sits on the engine's redirect line, not elsewhere" \
   grep -q '</dev/null 9>&- &' "$WORK/start_engine.body"
+
+# The same static-body discipline one layer earlier: bind_direct_outbound must
+# invoke jq with the SHARED $BIND_JQ constant. If the program were re-inlined
+# at the run-side call site while the constant stayed put, plan_up would keep
+# mirroring the constant and the plan would assert a program the run does not
+# execute — the exact opposite of what the plan-for-that-must-match guarantees.
+# The dry-run assertions cover the plan side; this greps the EXTRACTED
+# function body (same sed range convention as start_engine above), so it is
+# always runnable and anchored where the fix lives.
+sed -n '/^bind_direct_outbound() {/,/^}/p' "$HELPER" >"$WORK/bind.body"
+check "bind_direct_outbound still invokes jq with the shared BIND_JQ constant" \
+  grep -q 'jq --arg iface "$UPLINK_DEV" "$BIND_JQ"' "$WORK/bind.body"
 
 # =============================================================================
 echo
@@ -486,10 +499,13 @@ else
 fi
 UPLINK_DEV=uplink0
 
-# F: teardown deletes exactly the recorded prefixes — full prefixes as they
-#    stand — and a bare address left by an older build still gets its host-route
-#    niceness, because deleting the bare address deletes nothing.
-printf '4 203.0.113.10/32\n4 10.0.0.0/8\n6 2001:db8::9/128\n4 203.0.113.77\n' >"$ROUTES_FILE"
+# F: teardown deletes exactly the recorded prefixes — and the file only ever
+#    holds the shapes the helper writes: `4 <ip>/32`, `6 <ip>/128`, plus one
+#    legacy BARE address (still accepted for files an older build left) that
+#    must delete as a /32. A direct range like 10.0.0.0/8 is deliberately NOT
+#    here: nothing writes ranges since the direct outbound moved to socket
+#    binding.
+printf '4 203.0.113.10/32\n6 2001:db8::9/128\n4 198.51.100.7\n' >"$ROUTES_FILE"
 remove_server_routes
 # The del argv land in the same log the replaces did; printing it here is what
 # lets the suite assert the exact teardown commands.
@@ -577,12 +593,12 @@ check_contains "the failed bind rewrote nothing" "$drv" \
   "H3 config untouched"
 check_not_contains "no direct-pinning leftovers in the driver" "$drv" \
   "unexpectedly succeeded"
-check_contains "teardown deletes recorded prefixes as they stand" "$drv" \
-  "-4 route del 10.0.0.0/8"
-check_contains "teardown keeps the host-route niceness for a v6 entry" "$drv" \
+check_contains "teardown deletes the recorded v4 /32 exactly" "$drv" \
+  "-4 route del 203.0.113.10/32"
+check_contains "teardown deletes the recorded v6 /128 exactly" "$drv" \
   "-6 route del 2001:db8::9/128"
 check_contains "a bare address from an older build is torn down as a /32" "$drv" \
-  "-4 route del 203.0.113.77/32"
+  "-4 route del 198.51.100.7/32"
 check "the routes file is removed once teardown has read it" \
   grep -q 'F routes-file-gone=yes' <<<"$drv"
 
