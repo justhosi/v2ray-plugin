@@ -1,0 +1,1226 @@
+#!/bin/bash
+# =============================================================================
+# omarchy-v2ray-tun — the PRIVILEGED half of TUN mode.
+# =============================================================================
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The unprivileged backend (bin/omarchy-v2ray) owns the profiles, parses the
+# share links and runs the ordinary local-proxy engine as the desktop user. TUN
+# mode is different: creating a tun device and installing routes needs
+# CAP_NET_ADMIN, which a bar widget must never be able to ask for directly.
+#
+# So the capability lives here, in a separate file that is only ever executed as
+# root, and the boundary between the two halves is deliberately narrow:
+#
+#   * The caller names ONE profile id and nothing else. No paths, no engine, no
+#     interface name, no DNS server arrives on the command line. Everything the
+#     helper touches is either a compile-time constant or re-derived here from
+#     the invoking account's passwd entry.
+#   * The engine runs as the INVOKING USER with only CAP_NET_ADMIN (never as
+#     root), so the tunnel's own config parser cannot be used to touch anything
+#     outside the network namespace.
+#   * The unprivileged side only ever READ state.json. Nothing in
+#     bin/omarchy-v2ray gains privileges, ever.
+#
+# That is what makes a polkit rule for this file defensible: the worst a caller
+# can ask for is "bring up TUN for a profile I already own", which is exactly
+# the authority the capability grants anyway.
+#
+# IDENTITY: PKEXEC_UID, NEVER $HOME OR $SUDO_USER
+# ----------------------------------------------
+# pkexec sanitises the environment but still tells us which account asked, in
+# PKEXEC_UID. That number is the only identity input accepted here. $HOME is
+# whatever the caller exported, so a crafted HOME redirects the helper at an
+# attacker-chosen config file; $SUDO_USER is a plain string and is similarly
+# caller-controlled. Both are ignored. The uid is resolved through getent so
+# NSS (LDAP, SSSD, ...) is honoured, and the home directory comes from that same
+# passwd entry.
+#
+# INSTALLED WHERE, AND WHY IT MATTERS
+# -----------------------------------
+# The plugin itself lives in ~/.config/omarchy/plugins/, which the desktop user
+# owns. A "privileged half" that lives there is not privileged at all: any
+# process running as that user could rewrite it and have the next pkexec run
+# their code as root (silently, once a polkit rule names that path). So the
+# helper that pkexec executes is installed by `omarchy-v2ray install-tun` at
+#
+#   /usr/local/lib/omarchy-v2ray/omarchy-v2ray-tun
+#
+# (root-owned, 0755), and this script refuses to run privileged unless its own
+# $0 resolves to a root-owned file that is not group- or world-writable. The
+# unprivileged launcher repeats that check before it asks for a password, so a
+# user-owned path is rejected without a prompt. Dry-run is exempt: it elevates
+# nothing and is how the repo copy is tested.
+#
+# ROOT NEVER OPENS THE PROFILE
+# ----------------------------
+# The profile tree is owned by the caller, so a check-then-open by root is a
+# classic TOCTOU. The config is therefore built by running jq AS THE INVOKING
+# USER (setpriv) and piping its stdout into a root-opened file in the run
+# directory. A path swapped for a root-only file simply fails with EACCES in the
+# user's own process; root never reads anything the caller could not.
+#
+# That invariant is literal: the profile path appears only in the argument list
+# of the USER-side jq (and in the dry-run plan). Every root-side read after the
+# transform — the SOCKS port probe, the engine, the teardown metadata — uses the
+# root-owned config.json that the pipeline produced and validated.
+#
+# THREAT MODEL / TOCTOU
+# ---------------------
+# The config we hand the engine is owned by the invoking user and mode 0600 —
+# the engine runs as that user, so it has to read its own config. That means the
+# user CAN rewrite the bytes between our jq run and the engine's read. This is
+# accepted, deliberately, and it is not an escalation:
+#
+#   * the config only steers an engine the user already controls;
+#   * the only elevated capability is CAP_NET_ADMIN, so a swapped config can do
+#     exactly what net_admin can do — create/rename links, add routes — and
+#     nothing else (no file access, no process control, no root shell);
+#   * the helper never reads the config back, so a swapped file cannot change
+#     what the helper later tears down (the iface, DNS and pid are recorded in
+#     the state file by us, not taken from the config).
+#
+# The alternative — a config the user cannot write — is impossible while the
+# engine runs as the user. The file is therefore deleted as soon as the engine
+# has parsed it (the interface appearing proves it did), so no credential copy
+# lingers in /run.
+#
+# WHY A SUPERVISOR
+# ----------------
+# The classic TUN failure is "the engine died, the default route still points at
+# a tun device that no longer exists, and the machine has no network". The kernel
+# drops routes with the device, but DNS overrides and half-installed routes can
+# survive a crash, and a helper that exits the moment the engine starts can do
+# nothing about it. So `up` does not exit: it waits for the engine, and on ANY
+# exit path restores DNS, removes the /1 routes and deletes the state file. The
+# `down` verb does the same work explicitly, and also cleans up when only the
+# interface is left behind.
+#
+# VERBS
+# -----
+#   up <id>   Validate, build the tun config, point DNS into the tunnel, start
+#             the engine as the invoking user with net_admin, then supervise.
+#   down      Idempotent teardown. Safe to call when nothing is running, and
+#             after the profile has been deleted.
+#   status    Read-only JSON snapshot for the unprivileged backend.
+#
+# DRY RUN
+# -------
+#   OMARCHY_V2RAY_TUN_DRY_RUN=1 runs the WHOLE validation path and prints the
+#   exact argv of every command it would run, then exits without touching /run,
+#   DNS or any process. It is the only unprivileged mode, and the only way the
+#   privileged slice can be tested on a machine where nothing may actually be
+#   changed. down and status accept it too.
+#
+# There is intentionally no `eval` anywhere below, and no unquoted expansion of a
+# value that came from a file or from the environment.
+#
+# =============================================================================
+
+# `-u` catches typos; `pipefail` makes a failing command inside a pipeline fail.
+# No `-e`, for the same reason as the unprivileged backend: several steps must
+# inspect a non-zero exit code and keep cleaning up.
+set -uo pipefail
+
+# A pkexec-launched process inherits a brutally small environment, and this
+# script must not depend on whatever PATH it happens to get: a "helpful" wrapper
+# earlier on PATH would otherwise decide which `ip`, `resolvectl` or `jq` runs
+# as root. Pin it before anything else is looked up.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# -----------------------------------------------------------------------------
+# Paths and tunables.
+#
+# OMARCHY_V2RAY_TUN_RUN_DIR and friends are test/dry-run seams. pkexec does not
+# carry them across the privilege boundary, so in production they are always the
+# defaults; they exist so the test suite can exercise the real code path in a
+# temp directory instead of /run.
+# -----------------------------------------------------------------------------
+RUN_DIR="${OMARCHY_V2RAY_TUN_RUN_DIR:-/run/omarchy-v2ray-tun}"
+STATE_FILE="$RUN_DIR/state.json"
+CONFIG_FILE="$RUN_DIR/config.json"
+ENGINE_LOG="$RUN_DIR/engine.log"
+HELPER_LOG="$RUN_DIR/helper.log"
+LAST_ERROR="$RUN_DIR/last-error"
+LOCK_FILE="$RUN_DIR/lock"
+RESOLV_BAK="$RUN_DIR/resolv.conf.orig"
+RESOLV_NEW="$RUN_DIR/resolv.conf.new"
+
+# The tun interface name is chosen by US, not by the caller. It reaches `ip` and
+# `resolvectl` as an argument, so it is validated below like any other untrusted
+# text (`-foo` would otherwise be read as an option).
+IFACE="${OMARCHY_V2RAY_TUN_IFACE:-omarchy-tun}"
+
+# Resolvers used while the tunnel is up. The /1 routes below send all traffic
+# through the tun, so leaving the system resolver in place would leak DNS
+# queries outside the tunnel — and would fail outright once the tunnel owns the
+# default route.
+DNS_LIST="${OMARCHY_V2RAY_TUN_DNS:-1.1.1.1 9.9.9.9}"
+
+# How long `down` waits for a start that is already in progress. Test seam only:
+# pkexec does not pass environment variables across the privilege boundary.
+LOCK_TIMEOUT="${OMARCHY_V2RAY_TUN_LOCK_TIMEOUT:-20}"
+
+# The ONLY engine paths this helper will ever execute. A path that is not on this
+# list is not looked at, even if it is called `xray`, because a root helper that
+# takes an executable path from a caller is a privilege-escalation primitive.
+# Order is preference: xray before v2ray, /usr/local before /usr.
+ENGINE_ALLOWLIST=(
+  /usr/local/bin/xray
+  /usr/bin/xray
+  /usr/bin/v2ray
+)
+
+# Engine config for the tun inbound. The profile's inbounds/outbounds/routing/dns
+# are left untouched; any pre-existing tun inbound is dropped so a re-imported
+# profile cannot end up with two.
+#
+# WHY THE /1 ROUTES: 0.0.0.0/1 + 128.0.0.0/1 together cover the whole IPv4
+# address space and are more specific than the real 0.0.0.0/0 default, so the
+# kernel prefers them without us having to REPLACE the default route. That
+# matters for teardown: deleting two /1 routes is a clean, idempotent delete,
+# while restoring a replaced default route is guesswork if the network changed
+# underneath us. The IPv6 pair does the same for ::/0.
+#
+# WHY autoOutboundsInterface:"auto": the engine's own outbound connections must
+# not go back into the tun it just created, or the tunnel would dial itself.
+# "auto" is the documented loop-prevention setting for that field.
+TUN_INBOUND_JQ='.inbounds = (((.inbounds // []) | map(select(.protocol != "tun"))) + [{tag:"tun-in",protocol:"tun",settings:{name:$iface,mtu:1500,gateway:["10.66.0.1/16","fc00:66::1/64"],autoSystemRoutingTable:["0.0.0.0/1","128.0.0.0/1","::/1","8000::/1"],autoOutboundsInterface:"auto"}}])'
+
+# Set once the engine is our child; used by every teardown path.
+ENGINE_PID=""
+# Set once we have actually changed DNS; the supervisor and every failure path
+# check it before trying to restore something that was never touched.
+DNS_CHANGED=0
+# Set once config.json exists; an EXIT trap removes it on any path that does not
+# reach the normal post-readiness delete (see cmd_up).
+CONFIG_GUARD=0
+
+# Collected only in dry-run mode.
+DRY_COMMANDS=()
+
+# -----------------------------------------------------------------------------
+# Output helpers. Every exit path prints ONE JSON document on stdout, so the
+# caller never has to parse a human sentence — and stderr stays free for jq and
+# friends, which are not part of the contract.
+# -----------------------------------------------------------------------------
+is_dry_run() { [[ ${OMARCHY_V2RAY_TUN_DRY_RUN:-0} == 1 ]]; }
+
+refuse() {
+  # $* = human-readable, actionable reason. Never includes the config, the UUID
+  # or the share link: those must not end up in a log, a terminal or a panel.
+  jq -n --arg error "$*" '{ok:false, error:$error}' 2>/dev/null \
+    || printf '{"ok":false,"error":"refused"}\n'
+  helper_log "refused: $*"
+  exit 1
+}
+
+helper_log() {
+  # Append-only operational log, 0640. The run directory may not exist yet (a
+  # refusal before `up` created it), and dry-run must not create anything, so
+  # both cases silently no-op.
+  [[ ${OMARCHY_V2RAY_TUN_DRY_RUN:-0} == 1 ]] && return 0
+  [[ -d $RUN_DIR ]] || return 0
+  [[ -w $RUN_DIR ]] || return 0
+  # One line per entry, always. Refusal messages now include the offending
+  # profile id, and an id with an embedded newline would otherwise let a caller
+  # forge log lines.
+  local safe="$*"
+  safe="${safe//$'\n'/ }"
+  safe="${safe//$'\r'/ }"
+  printf '%s %s\n' "$(date -Is 2>/dev/null || date)" "$safe" >>"$HELPER_LOG" 2>/dev/null || true
+}
+
+dry_cmd() {
+  # Record one command as a shell-quoted string, so the plan is readable and can
+  # be pasted back into a terminal. It is never executed here. Arguments that a
+  # shell would treat specially (the jq program, '~.', paths with spaces) get
+  # single quotes; simple words stay bare. `~` is deliberately not "simple": a
+  # leading tilde would expand if the line were pasted back.
+  local out="" arg quoted
+  for arg in "$@"; do
+    if [[ -z $arg ]]; then
+      quoted="''"
+    elif [[ $arg =~ ^[A-Za-z0-9_./:=+@%,^-]+$ ]]; then
+      quoted="$arg"
+    else
+      quoted="'$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
+    fi
+    out+="${out:+ }$quoted"
+  done
+  DRY_COMMANDS+=("$out")
+}
+
+emit_dry_run() {
+  local compact
+  compact="$(jq -n --args '$ARGS.positional' "${DRY_COMMANDS[@]}")"
+  jq -n --argjson commands "$compact" '{ok:true, dryRun:true, commands:$commands}'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Privilege and identity.
+# -----------------------------------------------------------------------------
+require_privilege() {
+  # DRY RUN IS EXEMPT FROM BOTH CHECKS BELOW: it prints a plan and touches
+  # nothing, so a developer copy in the repo is allowed (and is the only way to
+  # test the privileged slice without root).
+  is_dry_run && return 0
+
+  # THE SELF-CHECK COMES FIRST, even before "am I root". The message the caller
+  # needs when they point pkexec at a user-owned copy is "install it", not "this
+  # process is not root" — and when it IS root, this is the check that stops a
+  # replaced "privileged half" from running attacker code.
+  #
+  # WHY THIS IS THE REAL BOUNDARY: the plugin lives under
+  # ~/.config/omarchy/plugins/, which the desktop user owns and can rewrite. If
+  # the helper were executed from there, any process running as that user could
+  # replace it and have it run as root — with one password prompt today, and
+  # silently once a polkit rule names that path. The installed copy lives in
+  # /usr/local/lib, and this check refuses anything else.
+  local self owner mode
+  self="$(readlink -f -- "$0" 2>/dev/null)" || self=""
+  [[ -n $self && -f $self && -x $self ]] \
+    || refuse "cannot resolve this helper's own path; refusing to run privileged. Install it with: omarchy-v2ray install-tun"
+  owner="$(stat -c '%u' -- "$self" 2>/dev/null)" \
+    || refuse "cannot stat this helper ($self); refusing to run privileged. Install it with: omarchy-v2ray install-tun"
+  mode="$(stat -c '%a' -- "$self" 2>/dev/null)" \
+    || refuse "cannot stat this helper ($self); refusing to run privileged. Install it with: omarchy-v2ray install-tun"
+  [[ $owner == 0 ]] \
+    || refuse "this helper ($self) is not owned by root (uid $owner), so a user could replace the code that runs as root. Install it with: omarchy-v2ray install-tun"
+  (( (8#$mode & 8#022) == 0 )) \
+    || refuse "this helper ($self) is group- or world-writable, so a user could replace the code that runs as root. Install it with: omarchy-v2ray install-tun"
+
+  # A root-owned file inside a user-writable directory is still replaceable by
+  # whoever owns the directory. Mirror install-tun's directory check here; it is
+  # cheap and catches a helper copied to /tmp with chown -R root.
+  local self_dir dir_owner dir_mode
+  self_dir="$(dirname -- "$self")"
+  [[ -d $self_dir ]] \
+    || refuse "the helper's directory ($self_dir) does not exist; install it with: omarchy-v2ray install-tun"
+  dir_owner="$(stat -c '%u' -- "$self_dir" 2>/dev/null)" \
+    || refuse "cannot inspect the helper's directory ($self_dir); install it with: omarchy-v2ray install-tun"
+  dir_mode="$(stat -c '%a' -- "$self_dir" 2>/dev/null)" \
+    || refuse "cannot inspect the helper's directory ($self_dir); install it with: omarchy-v2ray install-tun"
+  [[ $dir_owner == 0 ]] \
+    || refuse "the helper's directory ($self_dir) is not owned by root (uid $dir_owner), so a user could replace the code that runs as root. Install it with: omarchy-v2ray install-tun"
+  (( (8#$dir_mode & 8#022) == 0 )) \
+    || refuse "the helper's directory ($self_dir) is group- or world-writable, so a user could replace the code that runs as root. Install it with: omarchy-v2ray install-tun"
+
+  if [[ $EUID -ne 0 ]]; then
+    refuse "this helper must run as root through pkexec (never sudo, never directly): refusing as uid $EUID. Use the unprivileged backend: omarchy-v2ray tun-up <id>"
+  fi
+}
+
+resolve_invoker() {
+  # The one and only source of identity: PKEXEC_UID, validated as a number and
+  # resolved through NSS. See the header for why $HOME and $SUDO_USER are not
+  # used — both are caller-settable.
+  local uid entry name pw_uid gid home shell
+  if [[ $EUID -eq 0 ]]; then
+    if is_dry_run && [[ -z ${PKEXEC_UID:-} ]]; then
+      # A developer running the dry-run by hand as root: still only prints a
+      # plan, so falling back to the current account is safe.
+      uid="$(id -u)"
+    else
+      [[ -n ${PKEXEC_UID:-} ]] || refuse "PKEXEC_UID is not set: run this only through pkexec (omarchy-v2ray tun-up <id>), so the invoking account is unambiguous"
+      uid="$PKEXEC_UID"
+    fi
+  else
+    # Not root: only the dry-run is allowed, and then the invoker is this user.
+    uid="${PKEXEC_UID:-$(id -u)}"
+  fi
+
+  # ASCII digits only. In a UTF-8 locale, bash's =~ ranges are locale-sensitive
+  # and [0-9] can match non-ASCII digits; a uid made of those would then reach
+  # getent as garbage. The explicit class cannot.
+  [[ $uid =~ ^[0123456789]+$ ]] || refuse "invalid PKEXEC_UID"
+
+  # The engine must never run as root; a root invoker would defeat the whole
+  # "capability only, not uid 0" design. A dry-run may be done by root because
+  # it starts nothing.
+  if (( uid == 0 )) && ! is_dry_run; then
+    refuse "refusing to run the engine as root: TUN mode runs it as the invoking desktop user with CAP_NET_ADMIN only"
+  fi
+
+  entry="$(getent passwd "$uid" 2>/dev/null)" || entry=""
+  [[ -n $entry ]] || refuse "no passwd entry for uid $uid"
+
+  IFS=: read -r name _ pw_uid gid _ home shell <<<"$entry"
+  [[ $pw_uid == "$uid" ]] || refuse "passwd entry for uid $uid is inconsistent"
+  [[ $home == /* && $home != *..* ]] || refuse "uid $uid has an unusable home directory"
+
+  INVOKER_UID="$uid"
+  INVOKER_GID="$gid"
+  INVOKER_HOME="$home"
+  INVOKER_NAME="$name"
+
+  # A privileged helper must not take its config root from the environment: if
+  # it did, whoever can influence the environment could aim root's jq at a file
+  # of their choosing. The tree is re-derived from the passwd home instead. The
+  # OMARCHY_V2RAY_HOME seam is honoured ONLY in dry-run, where nothing is read
+  # as root's authority and nothing is written.
+  if is_dry_run && [[ -n ${OMARCHY_V2RAY_HOME:-} ]]; then
+    [[ $OMARCHY_V2RAY_HOME == /* ]] || refuse "OMARCHY_V2RAY_HOME must be an absolute path"
+    CONFIG_DIR="$OMARCHY_V2RAY_HOME"
+  else
+    CONFIG_DIR="$INVOKER_HOME/.config/omarchy-v2ray"
+  fi
+  PROFILES_DIR="$CONFIG_DIR/profiles"
+}
+
+# -----------------------------------------------------------------------------
+# Input validation. Everything below this line treats its input as hostile text.
+# -----------------------------------------------------------------------------
+validate_iface() {
+  # IFNAMSIZ is 15, and the first character must not be `-`: the name is passed
+  # to `ip` and `resolvectl`, where a leading dash would be parsed as an option.
+  [[ $IFACE =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$ ]] \
+    || refuse "invalid TUN interface name: refusing names that could be read as options or paths"
+}
+
+prepare_dns() {
+  local server
+  DNS_SERVERS=()
+  read -r -a DNS_SERVERS <<<"$DNS_LIST" || DNS_SERVERS=()
+  (( ${#DNS_SERVERS[@]} > 0 )) || refuse "no resolvers configured for TUN mode"
+  for server in "${DNS_SERVERS[@]}"; do
+    # Addresses only (IPv4/IPv6); the first character must not be a dash so the
+    # value can never be read as a resolvectl option.
+    [[ $server =~ ^[0-9A-Za-z][0-9A-Za-z:.%_-]*$ ]] \
+      || refuse "invalid resolver in OMARCHY_V2RAY_TUN_DNS"
+  done
+}
+
+validate_run_dir() {
+  # Absolute and boring. pkexec starts us in /, so a relative path would point
+  # somewhere unintended, and `..` must never be able to climb out of /run.
+  [[ $RUN_DIR == /* && $RUN_DIR != *..* ]] || refuse "invalid run directory"
+  [[ -L $RUN_DIR ]] && refuse "refusing a symlinked run directory"
+}
+
+find_engine() {
+  # Fixed allowlist, and every candidate must be root-owned and not writable by
+  # group or others. An attacker-writable "xray" would be a root code-execution
+  # hole; an engine found anywhere else is ignored rather than executed.
+  local candidate real owner mode v2ray_seen=0
+  ENGINE=""
+  for candidate in "${ENGINE_ALLOWLIST[@]}"; do
+    [[ -f $candidate && -x $candidate ]] || continue
+    # /usr/bin/xray is a real ELF on Arch, but distributions that symlink into
+    # /usr/lib are legitimate too: validate the file that will actually execute.
+    real="$(readlink -f -- "$candidate" 2>/dev/null)" || continue
+    [[ -f $real && -x $real ]] || continue
+    owner="$(stat -c '%u' -- "$real" 2>/dev/null)" || continue
+    mode="$(stat -c '%a' -- "$real" 2>/dev/null)" || continue
+    [[ $owner == 0 ]] || continue
+    (( (8#$mode & 8#022) == 0 )) || continue
+
+    if [[ $candidate == */v2ray ]]; then
+      v2ray_seen=1
+      continue
+    fi
+    ENGINE="$candidate"
+    return 0
+  done
+
+  if (( v2ray_seen )); then
+    # v2ray-core has no tun inbound, and it does not reject the key either: it
+    # would start an ordinary local proxy and the system-wide tunnel would
+    # silently never exist.
+    refuse "TUN needs the xray core (v2ray has no tun inbound): omarchy pkg aur add xray"
+  fi
+  refuse "TUN needs the xray core, and no engine is installed: omarchy pkg aur add xray"
+}
+
+validate_profile() {
+  # The id arrives as argv from the unprivileged caller, so it is re-validated
+  # here even though the backend already did it: this process is the one with
+  # root, and "the caller checked" is not a security argument.
+  local id="${1:-}"
+  [[ -n $id ]] || refuse "usage: omarchy-v2ray-tun up <profile-id>"
+  # The id is echoed in the refusal on purpose: "invalid profile id" alone lets a
+  # caller (and the test suite) mistake an engine/environment refusal for an id
+  # refusal. It is not a secret — it is a local profile slug.
+  [[ $id != *".."* ]] || refuse "invalid profile id: $id"
+  [[ $id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || refuse "invalid profile id: $id"
+  PROFILE_ID="$id"
+
+  local cfg="$PROFILES_DIR/$id.config.json"
+  # REFUSALS BELOW ARE DEFENCE IN DEPTH, NOT THE SECURITY BOUNDARY. Every
+  # directory in this chain is owned by the caller, so they can substitute a
+  # symlink between these checks and the open. The actual boundary is that root
+  # never opens the profile at all: build_tun_config runs jq as the INVOKING
+  # USER, so a path aimed at a root-only file fails with EACCES in their own
+  # process. These checks exist to fail early with a clear message.
+  #
+  # A symlink is rejected explicitly before -f, because -f follows it.
+  [[ -L $cfg ]] && refuse "refusing a symlinked profile config"
+  [[ -f $cfg ]] || refuse "unknown profile: $id"
+
+  local owner mode size
+  owner="$(stat -c '%u' -- "$cfg" 2>/dev/null)" || refuse "cannot stat the profile config"
+  mode="$(stat -c '%a' -- "$cfg" 2>/dev/null)" || refuse "cannot stat the profile config"
+  size="$(stat -c '%s' -- "$cfg" 2>/dev/null)" || refuse "cannot stat the profile config"
+
+  [[ $owner == "$INVOKER_UID" ]] \
+    || refuse "the profile config is not owned by the invoking user"
+  # Group/world-writable means somebody other than the owner can swap the bytes
+  # between the ownership check and jq's read.
+  (( (8#$mode & 8#022) == 0 )) \
+    || refuse "the profile config is group- or world-writable"
+  # A real xray config is ~1 KB. The ceiling is a memory bound on the copy the
+  # user's jq produces, checked again on the output.
+  (( size <= 1048576 )) || refuse "the profile config is implausibly large"
+
+  PROFILE_CONFIG="$cfg"
+}
+
+# -----------------------------------------------------------------------------
+# State file readers. state.json is ours (0644 root-owned in a root-owned
+# directory), but every field is still treated as text: it may be half-written
+# at the instant `status` samples it.
+# -----------------------------------------------------------------------------
+read_state_pid() {
+  [[ -f $STATE_FILE ]] || { printf ''; return 0; }
+  local pid
+  pid="$(jq -r 'if (.pid|type)=="number" then (.pid|floor|tostring)
+                elif (.pid|type)=="string" then .pid else "" end' "$STATE_FILE" 2>/dev/null)"
+  [[ $pid =~ ^[123456789][0123456789]*$ ]] || pid=""
+  printf '%s' "$pid"
+}
+
+read_state_iface() {
+  [[ -f $STATE_FILE ]] || { printf ''; return 0; }
+  local value
+  value="$(jq -r 'if (.iface|type)=="string" then .iface else "" end' "$STATE_FILE" 2>/dev/null)"
+  [[ $value =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$ ]] || value=""
+  printf '%s' "$value"
+}
+
+read_state_profile() {
+  [[ -f $STATE_FILE ]] || { printf ''; return 0; }
+  jq -r 'if (.profileId|type)=="string" then .profileId else "" end' "$STATE_FILE" 2>/dev/null
+}
+
+read_last_error() {
+  [[ -f $LAST_ERROR ]] || { printf ''; return 0; }
+  # Flatten first (the panel paints one line), then clamp. Clamping first can
+  # cut in the middle of a UTF-8 sequence; logs are ASCII, but the order is also
+  # simply easier to reason about: one line, at most ~400 characters.
+  tr '\n\r' '  ' <"$LAST_ERROR" 2>/dev/null \
+    | head -c 400 \
+    | sed 's/  */ /g;s/^ //;s/ $//'
+}
+
+# -----------------------------------------------------------------------------
+# Process helpers.
+# -----------------------------------------------------------------------------
+pid_live() { [[ -n ${1:-} && -d /proc/$1 ]]; }
+
+pid_is_engine() {
+  # Before signalling a pid that came out of a state file, make sure it still
+  # looks like an engine. /run is tmpfs, so the pid is from this boot, but a pid
+  # CAN be recycled after the engine dies; `kill` must never hit a stranger.
+  local comm
+  comm="$(cat -- "/proc/$1/comm" 2>/dev/null)" || return 1
+  [[ $comm == xray || $comm == v2ray ]]
+}
+
+port_listening() {
+  ss -Hltn "sport = :$1" 2>/dev/null | grep -q .
+}
+
+# -----------------------------------------------------------------------------
+# Run directory and lock.
+# -----------------------------------------------------------------------------
+ensure_run_dir() {
+  validate_run_dir
+  if [[ -e $RUN_DIR && ! -d $RUN_DIR ]]; then
+    refuse "the run path exists but is not a directory"
+  fi
+
+  mkdir -p -- "$RUN_DIR" || refuse "could not create the run directory"
+  chown 0:0 -- "$RUN_DIR" 2>/dev/null || refuse "could not own the run directory"
+  # 0711, not 0750 and not 0755. The unprivileged panel must TRAVERSE this
+  # directory to read state.json and last-error by path, but it has no business
+  # LISTING what is inside, and 0711 is exactly that: execute-only for others.
+  # What lives here, and why each mode is safe:
+  #   state.json    0644  profile id, iface, pid, epoch — no secret
+  #   last-error    0644  a flattened failure sentence — no secret
+  #   engine.log    0640  engine narration, root-readable only
+  #   helper.log    0640  operational log, root-readable only
+  #   config.json   0600  the credential; chowned to the invoking user because
+  #                       the engine reads it as that user, deleted as soon as
+  #                       the engine has parsed it (see build_tun_config)
+  chmod 0711 -- "$RUN_DIR" || refuse "could not set the run directory mode"
+
+  if [[ ! -e $HELPER_LOG ]]; then
+    : >"$HELPER_LOG" || refuse "could not create the helper log"
+  fi
+  chmod 0640 -- "$HELPER_LOG" 2>/dev/null || true
+}
+
+acquire_transition_lock() {
+  # The lock is a SHORT TRANSITION MUTEX, not a "tunnel is up" flag. It is held
+  # from validation through write_state, then released; the supervisor does NOT
+  # hold it, because a supervisor that held it forever would make `down` wait for
+  # a process that is waiting for the engine. A second `up` during the window
+  # refuses immediately rather than queueing behind a slow engine start.
+  #
+  # An flock on fd 9 cannot go stale: the kernel drops it when this process dies.
+  exec 9>>"$LOCK_FILE" || refuse "could not open the lock file"
+  chmod 0640 -- "$LOCK_FILE" 2>/dev/null || true
+  flock -n 9 || refuse "a start is already in progress (another omarchy-v2ray-tun is setting up the tunnel)"
+}
+
+acquire_teardown_lock() {
+  # `down` must serialise against a start in progress, but it cannot wait
+  # forever: a wedged start would make the panel's stop button do nothing. The
+  # timeout is a test seam only — pkexec does not carry environment variables
+  # across the privilege boundary, so production always uses 20s.
+  exec 9>>"$LOCK_FILE" || refuse "could not open the lock file"
+  chmod 0640 -- "$LOCK_FILE" 2>/dev/null || true
+  flock -w "$LOCK_TIMEOUT" 9 \
+    || refuse "another TUN operation is still in progress after ${LOCK_TIMEOUT}s; nothing was changed. Try again"
+}
+
+check_existing_state() {
+  local pid=""
+  [[ -f $STATE_FILE ]] && pid="$(read_state_pid)"
+  if [[ -n $pid ]] && pid_live "$pid"; then
+    refuse "a TUN session is already running (pid $pid); run omarchy-v2ray tun-down first"
+  fi
+  # A state file naming a dead pid is debris from a killed supervisor, not a
+  # reason to refuse; we hold the lock, so it is ours to clear.
+  [[ -f $STATE_FILE ]] && rm -f -- "$STATE_FILE"
+
+  # An interface with no state file means an engine still owns the device (a
+  # tun disappears when its owner dies), and xray cannot take over a live one.
+  if [[ -e /sys/class/net/$IFACE ]]; then
+    refuse "interface $IFACE already exists; run omarchy-v2ray tun-down first"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Config, DNS, engine.
+# -----------------------------------------------------------------------------
+find_jq() {
+  # jq is executed while root (the `cat` side of the pipeline) and as the user
+  # (the transform side), so it must be a system binary. The pinned PATH already
+  # limits where it can come from; the ownership check is the belt to that
+  # braces: an attacker-writable jq would be root code execution.
+  JQ_BIN=/usr/bin/jq
+  [[ -x $JQ_BIN ]] || JQ_BIN="$(command -v jq 2>/dev/null)"
+  [[ -n $JQ_BIN && -x $JQ_BIN ]] || refuse "jq is required to build the TUN config"
+  local owner mode
+  owner="$(stat -c '%u' -- "$JQ_BIN" 2>/dev/null)" || refuse "cannot stat jq"
+  mode="$(stat -c '%a' -- "$JQ_BIN" 2>/dev/null)" || refuse "cannot stat jq"
+  [[ $owner == 0 ]] || refuse "jq is not owned by root: $JQ_BIN"
+  (( (8#$mode & 8#022) == 0 )) || refuse "jq is group- or world-writable: $JQ_BIN"
+}
+
+build_tun_config() {
+  local tmp="$RUN_DIR/.config.json.$$"
+
+  # Create the temp file 0600 FROM ITS FIRST BYTE. The redirection below would
+  # otherwise create it with the helper's inherited umask (0644), and the
+  # explicit chmod 0600 only lands after the user's jq has streamed the
+  # credential into it — a window in which any local user could read the UUID.
+  # The umask stays set for the rest of the process; every later file has an
+  # explicit mode.
+  umask 077
+
+  # ROOT NEVER OPENS THE PROFILE. The caller owns every directory in the profile
+  # tree, so any check-then-open by root is racy; the fix is by construction, not
+  # by more checks. The jq transform runs as the invoking user (setpriv), and a
+  # root-side `cat` writes its stdout into the root-owned run directory. If the
+  # path is swapped for a root-only file, the user's own jq gets EACCES and the
+  # pipeline fails — there is no primitive left for root to read something the
+  # caller cannot.
+  command -v setpriv >/dev/null 2>&1 \
+    || refuse "setpriv (util-linux) is required to read the profile as its owner"
+  find_jq
+
+  # `--` terminates setpriv's options; jq gets the profile path as its last
+  # argument. `pipefail` (set at the top) makes a jq failure fail the pipeline
+  # even though `cat` succeeds. The redirect is opened by ROOT, so the user's jq
+  # never gets write access to the run directory.
+  if ! setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --clear-groups -- \
+         "$JQ_BIN" -c --arg iface "$IFACE" "$TUN_INBOUND_JQ" -- "$PROFILE_CONFIG" \
+       | cat >"$tmp"; then
+    rm -f -- "$tmp"
+    refuse "could not build the TUN config from profile $PROFILE_ID (its owner must be able to read it)"
+  fi
+
+  # Bound the RESULT, not just the source: a user's jq could emit a huge (or
+  # empty) document, and the engine would happily parse it.
+  local out_size
+  out_size="$(stat -c '%s' -- "$tmp" 2>/dev/null)" || out_size=0
+  (( out_size > 0 && out_size <= 1048576 )) \
+    || { rm -f -- "$tmp"; refuse "the generated TUN config is empty or implausibly large"; }
+  jq -e '.inbounds | type == "array"' "$tmp" >/dev/null 2>&1 \
+    || { rm -f -- "$tmp"; refuse "the profile did not produce a valid engine config"; }
+
+  # The engine runs as the invoking user, so the file must be owned by them and
+  # 0600. The directory stays root-owned, so the user can rewrite the CONTENT
+  # but cannot replace the path with a symlink; see the TOCTOU note in the
+  # header for why the content swap is not an escalation.
+  chown "$INVOKER_UID:$INVOKER_GID" -- "$tmp" 2>/dev/null \
+    || { rm -f -- "$tmp"; refuse "could not hand the config to the invoking user"; }
+  chmod 0600 -- "$tmp" || { rm -f -- "$tmp"; refuse "could not protect the config"; }
+  mv -f -- "$tmp" "$CONFIG_FILE" || { rm -f -- "$tmp"; refuse "could not publish the config"; }
+}
+
+detect_dns_mode() {
+  # Prefer systemd-resolved: it can attach resolvers to ONE link, so the rest of
+  # the system keeps working and `resolvectl revert` restores the old state
+  # exactly. Rewriting /etc/resolv.conf is the fallback for machines without it.
+  DNS_MODE="file"
+  if command -v resolvectl >/dev/null 2>&1 \
+     && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    DNS_MODE="resolved"
+  fi
+}
+
+snapshot_dns() {
+  detect_dns_mode
+  if [[ $DNS_MODE == "file" ]]; then
+    # RECOVER A CRASHED SESSION FIRST, THEN SNAPSHOT. If a supervisor was
+    # SIGKILLed after apply_dns, /etc/resolv.conf currently holds the TUNNEL's
+    # resolvers and RESOLV_BAK still holds the user's real ones. Taking a fresh
+    # snapshot here would bless the tunnel resolvers as "the original", and every
+    # later teardown would restore them — the user's real DNS config would be lost
+    # for good. So: restore from the old backup, delete it (restore_dns uses its
+    # presence as the mode marker), and only then copy the live file aside.
+    if [[ -f $RESOLV_BAK ]]; then
+      if ! cp -- "$RESOLV_BAK" /etc/resolv.conf 2>/dev/null; then
+        # Refusing is the only safe answer: starting now would overwrite the one
+        # copy of the user's real resolvers with the tunnel's.
+        rm -f -- "$CONFIG_FILE"
+        refuse "a previous TUN session left a DNS backup that cannot be restored; refusing to overwrite it. Restore /etc/resolv.conf from $RESOLV_BAK by hand"
+      fi
+      rm -f -- "$RESOLV_BAK" "$RESOLV_NEW"
+      helper_log "recovered /etc/resolv.conf from a previous crashed session"
+    fi
+
+    # A COPY, not a symlink and not a rename: /etc/resolv.conf is frequently a
+    # symlink into /run, and moving it would break the manager that owns it.
+    # `cp` dereferences, so the backup is always a plain file we can put back.
+    cp -- /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null \
+      || refuse "could not back up /etc/resolv.conf"
+    chmod 0644 -- "$RESOLV_BAK" 2>/dev/null || true
+  fi
+}
+
+apply_dns() {
+  if [[ $DNS_MODE == "resolved" ]]; then
+    # This runs AFTER the engine created the link: resolvectl addresses a link
+    # by name, and a name that does not exist yet is an error. Snapshotting
+    # first is still right — it is the step that must not be lost.
+    resolvectl dns "$IFACE" "${DNS_SERVERS[@]}" >/dev/null 2>&1 || return 1
+    DNS_CHANGED=1
+    # `~.` makes this link the resolver for EVERY domain, including the
+    # single-label names that would otherwise still use the physical link and
+    # leak outside the tunnel.
+    resolvectl domain "$IFACE" '~.' >/dev/null 2>&1 || return 1
+    return 0
+  fi
+
+  printf 'nameserver %s\n' "${DNS_SERVERS[@]}" >"$RESOLV_NEW" 2>/dev/null || return 1
+  chmod 0644 -- "$RESOLV_NEW" 2>/dev/null || true
+  cp -- "$RESOLV_NEW" /etc/resolv.conf 2>/dev/null || return 1
+  DNS_CHANGED=1
+  return 0
+}
+
+restore_dns() {
+  # A backup file is the evidence that the file mode was used; its absence means
+  # resolved (or that we never got that far). Both paths are idempotent.
+  if [[ -f $RESOLV_BAK ]]; then
+    cp -- "$RESOLV_BAK" /etc/resolv.conf 2>/dev/null || true
+    rm -f -- "$RESOLV_BAK" "$RESOLV_NEW"
+    helper_log "restored /etc/resolv.conf"
+    return 0
+  fi
+  # A per-link resolved configuration disappears with the link, so an absent
+  # interface needs no revert. If the interface is still there, revert it.
+  if [[ -n ${IFACE:-} && -d /sys/class/net/$IFACE ]] \
+     && command -v resolvectl >/dev/null 2>&1; then
+    resolvectl revert "$IFACE" >/dev/null 2>&1 || true
+    helper_log "reverted resolvectl for $IFACE"
+  fi
+}
+
+remove_routes() {
+  local iface="${1:-}"
+  # No interface, no routes of ours: a tun's routes are removed by the kernel
+  # when the device disappears. This exists for the case where the interface is
+  # still up but the helper is tearing down (explicit `down`, or a crash where
+  # the engine outlived us).
+  [[ -n $iface && -d /sys/class/net/$iface ]] || return 0
+
+  # Try the precise form first (device still set), then the bare prefix: xray's
+  # autoSystemRoutingTable installs the routes through the tun gateway, and a
+  # `dev`-qualified delete does not match a route that also carries `via`.
+  # Errors are ignored: "not found" is the normal case on the second attempt.
+  ip route del 0.0.0.0/1 dev "$iface" 2>/dev/null || true
+  ip route del 0.0.0.0/1 2>/dev/null || true
+  ip route del 128.0.0.0/1 dev "$iface" 2>/dev/null || true
+  ip route del 128.0.0.0/1 2>/dev/null || true
+  ip -6 route del ::/1 dev "$iface" 2>/dev/null || true
+  ip -6 route del ::/1 2>/dev/null || true
+  ip -6 route del 8000::/1 dev "$iface" 2>/dev/null || true
+  ip -6 route del 8000::/1 2>/dev/null || true
+}
+
+start_engine() {
+  command -v setpriv >/dev/null 2>&1 \
+    || refuse "setpriv (util-linux) is required to run the engine without full root"
+  command -v setsid >/dev/null 2>&1 || refuse "setsid is required to detach the engine"
+
+  : >"$ENGINE_LOG" || refuse "could not open the engine log"
+  chmod 0640 -- "$ENGINE_LOG" 2>/dev/null || true
+
+  # The engine runs as the INVOKING USER. `--reuid/--regid/--init-groups` drop
+  # every root privilege; `--inh-caps/--ambient-caps` then hand it exactly one
+  # capability. There is deliberately NO fallback to running it as root if
+  # setpriv fails — that would turn a packaging problem into a root engine.
+  #
+  # setsid + </dev/null + the log redirect detach it from the pkexec session, so
+  # it survives the helper's controlling terminal going away.
+  setsid setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --init-groups \
+    --inh-caps=+net_admin --ambient-caps=+net_admin -- \
+    "$ENGINE" run -c "$CONFIG_FILE" \
+    >>"$ENGINE_LOG" 2>&1 </dev/null &
+  ENGINE_PID=$!
+}
+
+engine_log_tail() {
+  [[ -f $ENGINE_LOG ]] || { printf ''; return 0; }
+  # Flattened, because it goes into one JSON string. The engine log never
+  # contains the profile's UUID or the share link, and the CONFIG is never
+  # echoed here.
+  tail -n 8 "$ENGINE_LOG" 2>/dev/null \
+    | tr '\n\r' '  ' \
+    | sed 's/  */ /g;s/^ //;s/ $//' \
+    | head -c 1200
+}
+
+write_last_error() {
+  [[ -d $RUN_DIR ]] || return 0
+  # 0644 IS DELIBERATE: the unprivileged panel reads this to explain a failed
+  # start, and it is the only reason the run directory is traversable at all.
+  # What makes publishing it safe is the assumption that a warning-level xray
+  # log narrates network/protocol errors only — it never prints the profile's
+  # UUID, the share link or the config, and this function is never given any of
+  # them. Keep it that way: pass a reason and the engine tail, nothing else.
+  #
+  # The text is folded and capped so the file stays small and one logical line.
+  # `head -c` (not cut) does the byte cap; the engine log is ASCII, and the fold
+  # keeps any accidental long run from being chopped mid-word. If a future log
+  # line can carry multi-byte text, cap with a character-aware tool instead.
+  local text
+  text="$(printf '%s\n' "$1" | fold -s -w 200 | head -c 1200)"
+  printf '%s\n' "$text" >"$LAST_ERROR" 2>/dev/null || return 0
+  chmod 0644 -- "$LAST_ERROR" 2>/dev/null || true
+}
+
+teardown() {
+  # The single teardown path used by the supervisor, the signal handler and the
+  # failure path. It must be safe to call twice and safe when half of the setup
+  # never happened.
+  if [[ -n ${ENGINE_PID:-} ]] && pid_live "$ENGINE_PID" && pid_is_engine "$ENGINE_PID"; then
+    kill -TERM "$ENGINE_PID" 2>/dev/null || true
+    local i
+    for i in $(seq 1 25); do
+      pid_live "$ENGINE_PID" || break
+      sleep 0.2
+    done
+    pid_live "$ENGINE_PID" && kill -KILL "$ENGINE_PID" 2>/dev/null || true
+  fi
+  restore_dns
+  remove_routes "${IFACE:-}"
+  rm -f -- "$STATE_FILE" "$CONFIG_FILE"
+}
+
+fail_start() {
+  # Everything after the engine was launched lands here: kill it, put DNS back,
+  # drop the routes, remove the config and record WHY, so the panel can say it.
+  local reason="$1" detail
+  detail="$(engine_log_tail)"
+  [[ -n $detail ]] || detail="the engine produced no output"
+
+  helper_log "up failed: $reason"
+  write_last_error "$reason — $detail"
+  teardown
+  jq -n --arg error "$reason" --arg detail "$detail" \
+    '{ok:false, error:$error, detail:$detail}'
+  exit 1
+}
+
+write_state() {
+  local tmp="$RUN_DIR/.state.json.$$"
+  jq -n --arg profileId "$PROFILE_ID" --arg iface "$IFACE" \
+        --arg pid "$ENGINE_PID" --argjson since "$(date +%s)" \
+    '{profileId:$profileId, iface:$iface, pid:$pid, since:$since}' >"$tmp" 2>/dev/null \
+    || { rm -f -- "$tmp"; return 1; }
+  chmod 0644 -- "$tmp" 2>/dev/null || true
+  # Temp + rename: the unprivileged reader samples this file on a timer, and a
+  # half-written document would (correctly) be read as "not active".
+  mv -f -- "$tmp" "$STATE_FILE" || { rm -f -- "$tmp"; return 1; }
+}
+
+supervise_engine() {
+  local rc=0
+
+  # The trap was installed by install_teardown_trap BEFORE the engine started;
+  # it stays armed through the readiness window and the whole supervision.
+  wait "$ENGINE_PID"
+  rc=$?
+  trap - TERM INT HUP
+
+  helper_log "engine exited (status $rc)"
+  # On ANY exit path — clean exit, crash, signal — restore the network before
+  # exiting. This is the piece that prevents "the engine died, the route still
+  # points at a dead tun, no internet".
+  teardown
+  jq -n --argjson rc "$rc" '{ok:true, exited:true, status:$rc}'
+  exit 0
+}
+
+install_teardown_trap() {
+  # ABOVE start_engine, not inside the supervisor. A TERM during the readiness
+  # window used to fall through a sleeping loop and leave a detached engine with
+  # modified DNS and no state file — the exact "no internet, nothing to stop"
+  # state this helper exists to prevent. The handler is idempotent: ENGINE_PID is
+  # empty before start_engine, so teardown is safe at any point.
+  trap 'trap - TERM INT HUP; helper_log "supervisor received a signal"; teardown; exit 143' TERM INT HUP
+}
+
+# -----------------------------------------------------------------------------
+# Dry-run planning.
+# -----------------------------------------------------------------------------
+plan_up() {
+  # Mirrors cmd_up step for step. The config is never printed (it carries the
+  # credential); only the jq argv that WOULD write it, which names the source
+  # path and the tun settings but not the profile's contents.
+  detect_dns_mode
+
+  dry_cmd mkdir -p -- "$RUN_DIR"
+  dry_cmd chown 0:0 -- "$RUN_DIR"
+  dry_cmd chmod 0711 -- "$RUN_DIR"
+  # The profile is transformed by the INVOKING USER's jq; `| cat > config.json`
+  # is the root side of that pipeline and is implied by the argv below (a
+  # redirect is not an argv element). See build_tun_config for the reasoning.
+  find_jq
+  dry_cmd setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --clear-groups -- \
+    "$JQ_BIN" -c --arg iface "$IFACE" "$TUN_INBOUND_JQ" -- "$PROFILE_CONFIG"
+  # Mirror build_tun_config exactly: the chown/chmod happen on the TEMP file,
+  # then it is renamed into place. Showing them on $CONFIG_FILE would drift from
+  # the real order (and imply the destination is written in place).
+  local plan_tmp="$RUN_DIR/.config.json.tmp"
+  dry_cmd chown "$INVOKER_UID:$INVOKER_GID" -- "$plan_tmp"
+  dry_cmd chmod 0600 -- "$plan_tmp"
+  dry_cmd mv -f -- "$plan_tmp" "$CONFIG_FILE"
+
+  if [[ $DNS_MODE == "resolved" ]]; then
+    # Nothing to snapshot: systemd-resolved keeps the old configuration until we
+    # override this link, and `resolvectl revert` later restores it.
+    :
+  else
+    dry_cmd cp -- /etc/resolv.conf "$RESOLV_BAK"
+  fi
+
+  dry_cmd setsid setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --init-groups \
+    --inh-caps=+net_admin --ambient-caps=+net_admin -- \
+    "$ENGINE" run -c "$CONFIG_FILE"
+
+  # DNS is applied AFTER the engine starts: resolvectl addresses a link by name
+  # and the link is created by the engine, so the spec's "snapshot, then point
+  # DNS" order can only be honoured for the snapshot. The plan shows the real
+  # order, not the aspirational one.
+  if [[ $DNS_MODE == "resolved" ]]; then
+    dry_cmd resolvectl dns "$IFACE" "${DNS_SERVERS[@]}"
+    dry_cmd resolvectl domain "$IFACE" '~.'
+  else
+    dry_cmd cp -- "$RESOLV_NEW" /etc/resolv.conf
+  fi
+
+  # The rest of the lifecycle. `up` becomes the supervisor, so these are the
+  # commands it would run when the engine exits; showing them here makes the
+  # whole mutation set visible before anything happens.
+  dry_cmd ip route del 0.0.0.0/1 dev "$IFACE"
+  dry_cmd ip route del 128.0.0.0/1 dev "$IFACE"
+  dry_cmd ip -6 route del ::/1 dev "$IFACE"
+  dry_cmd ip -6 route del 8000::/1 dev "$IFACE"
+  if [[ $DNS_MODE == "resolved" ]]; then
+    dry_cmd resolvectl revert "$IFACE"
+  else
+    dry_cmd cp -- "$RESOLV_BAK" /etc/resolv.conf
+  fi
+  dry_cmd rm -f -- "$STATE_FILE" "$CONFIG_FILE"
+}
+
+plan_down() {
+  local pid="$1" iface="$2"
+  local did=false
+
+  if [[ -n $pid ]] && pid_live "$pid"; then
+    dry_cmd kill -TERM "$pid"
+    did=true
+  fi
+  if [[ -f $RESOLV_BAK ]]; then
+    dry_cmd cp -- "$RESOLV_BAK" /etc/resolv.conf
+    did=true
+  elif [[ -n $iface ]] && command -v resolvectl >/dev/null 2>&1 && [[ -d /sys/class/net/$iface ]]; then
+    dry_cmd resolvectl revert "$iface"
+    did=true
+  fi
+  if [[ -n $iface && -d /sys/class/net/$iface ]]; then
+    dry_cmd ip route del 0.0.0.0/1 dev "$iface"
+    dry_cmd ip route del 128.0.0.0/1 dev "$iface"
+    dry_cmd ip -6 route del ::/1 dev "$iface"
+    dry_cmd ip -6 route del 8000::/1 dev "$iface"
+    did=true
+  fi
+  if [[ -e $STATE_FILE || -e $CONFIG_FILE ]]; then
+    dry_cmd rm -f -- "$STATE_FILE" "$CONFIG_FILE"
+    did=true
+  fi
+
+  # `did` documents the intent; an empty list is the honest answer for "nothing
+  # was running", and the test suite asserts that.
+  : "$did"
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: up
+# -----------------------------------------------------------------------------
+cmd_up() {
+  local id="${1:-}"
+
+  require_privilege
+  resolve_invoker
+  validate_iface
+  prepare_dns
+  validate_run_dir
+  # The id/config first: an invalid id must be reported as such on every host,
+  # including one with no usable engine, so the caller learns the request was
+  # bad rather than the machine.
+  validate_profile "$id"
+  find_engine
+
+  if is_dry_run; then
+    plan_up
+    emit_dry_run
+  fi
+
+  ensure_run_dir
+  acquire_transition_lock
+  check_existing_state
+  build_tun_config
+
+  # From this instant config.json exists, and it carries the credential. Every
+  # exit path that does not reach the normal post-readiness delete — a refusal
+  # in snapshot_dns or start_engine, a failed readiness wait, a signal, an
+  # unexpected `set -u` abort — must remove it. One EXIT trap is safer than
+  # remembering `rm -f` at each of those sites.
+  CONFIG_GUARD=1
+  trap '[[ ${CONFIG_GUARD:-0} == 1 ]] && rm -f -- "$CONFIG_FILE"' EXIT
+
+  snapshot_dns
+
+  # Read the port from the ROOT-OWNED COPY we just built, never from the
+  # caller-owned profile: the profile path is swappable, and this line runs as
+  # root. $CONFIG_FILE is the validated output of the user-side jq pipeline.
+  SOCKS_PORT="$(jq -r '[.inbounds[] | select(.protocol=="socks" or .protocol=="http")][0].port // empty' "$CONFIG_FILE" 2>/dev/null)"
+  # ASCII digits: =~ ranges are locale-sensitive (see resolve_invoker).
+  [[ $SOCKS_PORT =~ ^[0123456789]+$ ]] || SOCKS_PORT=10808
+
+  # Armed BEFORE the engine exists; see install_teardown_trap.
+  install_teardown_trap
+  start_engine
+
+  # ONE 10-second readiness budget for all three conditions: the interface
+  # exists, the profile's SOCKS port listens, and the engine is still alive. DNS
+  # is applied the moment the interface appears (resolvectl needs the link) and
+  # before the port check, so a slow handshake does not leave DNS unpointed.
+  local ready=false dns_applied=false iface_seen=false died=false i
+  for i in $(seq 1 100); do
+    if ! pid_live "$ENGINE_PID"; then
+      died=true
+      break
+    fi
+    if [[ -e /sys/class/net/$IFACE ]]; then
+      iface_seen=true
+      if [[ $dns_applied == false ]]; then
+        if ! apply_dns; then
+          fail_start "could not point DNS at the tunnel ($IFACE)"
+        fi
+        dns_applied=true
+      fi
+      if port_listening "$SOCKS_PORT"; then
+        ready=true
+        break
+      fi
+    fi
+    sleep 0.1
+  done
+
+  if [[ $ready != true ]]; then
+    if [[ $died == true ]]; then
+      fail_start "the engine exited while the tunnel was starting"
+    elif [[ $iface_seen != true ]]; then
+      fail_start "the tun interface $IFACE never appeared"
+    else
+      fail_start "the engine never opened its SOCKS port $SOCKS_PORT"
+    fi
+  fi
+
+  # The engine has parsed the config by now (the interface proves it), and it
+  # does not reload on its own, so the credential copy has no further use.
+  rm -f -- "$CONFIG_FILE"
+
+  write_state || fail_start "could not record the TUN state"
+
+  # The transition is over. Release the mutex BEFORE supervising: `down` must be
+  # able to stop a running tunnel, and it would otherwise wait for a supervisor
+  # that is itself waiting for the engine. The flock fd is the only thing closed
+  # here; failure to close it is impossible in bash and needs no branch.
+  exec 9>&-
+
+  # A successful start clears the previous failure, so the panel stops showing
+  # a stale "why it failed" line.
+  rm -f -- "$LAST_ERROR"
+  helper_log "up: profile $PROFILE_ID, iface $IFACE, pid $ENGINE_PID"
+
+  supervise_engine
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: down
+# -----------------------------------------------------------------------------
+cmd_down() {
+  require_privilege
+  # Even a teardown needs identity only in dry-run (to resolve paths); the real
+  # one just reads root-owned files. Resolve it anyway so the plans and the
+  # privileged run share one code path.
+  resolve_invoker
+  validate_iface
+  # Teardown deletes files under RUN_DIR, so the same "not a symlink" rule as
+  # `up` applies: a redirected run directory would make root delete elsewhere.
+  validate_run_dir
+
+  local pid="" iface="" profile=""
+
+  if is_dry_run; then
+    # A plan may sample the state without the mutex: it mutates nothing, and
+    # taking the lock would create files, which dry-run promises not to do.
+    [[ -f $STATE_FILE ]] && pid="$(read_state_pid)"
+    [[ -f $STATE_FILE ]] && iface="$(read_state_iface)"
+    [[ -n $iface ]] || iface="$IFACE"
+    plan_down "$pid" "$iface"
+    emit_dry_run
+  fi
+
+  # LOCK FIRST, THEN READ THE STATE. `down` used to sample state.json before
+  # taking the mutex, so an `up` that completed during the flock wait could
+  # leave `down` acting on a snapshot that no longer existed (and deleting the
+  # NEW state file while leaving the new engine running). Holding the lock
+  # across read -> signal -> restore -> delete closes that window.
+  if [[ -d $RUN_DIR ]]; then
+    acquire_teardown_lock
+  fi
+
+  [[ -f $STATE_FILE ]] && pid="$(read_state_pid)"
+  [[ -f $STATE_FILE ]] && iface="$(read_state_iface)"
+  [[ -f $STATE_FILE ]] && profile="$(read_state_profile)"
+  [[ -n $iface ]] || iface="$IFACE"
+
+  if [[ -n $pid ]]; then
+    if pid_live "$pid" && pid_is_engine "$pid"; then
+      helper_log "down: stopping engine pid $pid (profile ${profile:-unknown})"
+      kill -TERM "$pid" 2>/dev/null || true
+      local i
+      for i in $(seq 1 25); do
+        pid_live "$pid" || break
+        sleep 0.2
+      done
+      # Escalate only if the engine ignored SIGTERM.
+      pid_live "$pid" && kill -KILL "$pid" 2>/dev/null || true
+    elif pid_live "$pid"; then
+      # The pid was recycled by something that is not an engine. Never signal
+      # a stranger just because a stale file named its number.
+      helper_log "down: state pid $pid is no longer an engine; not signalling it"
+    fi
+  elif [[ -d /sys/class/net/$iface ]]; then
+    # "state missing but the interface still exists": a killed supervisor left
+    # an engine behind. Without a pid we cannot stop it, but we can still undo
+    # the damage to DNS and routing and say so in the log.
+    helper_log "down: $iface exists without a state file; cleaning DNS and routes only"
+  fi
+
+  restore_dns
+  remove_routes "$iface"
+  rm -f -- "$STATE_FILE" "$CONFIG_FILE"
+
+  helper_log "down: complete"
+  jq -n '{ok:true, active:false}'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommand: status
+# -----------------------------------------------------------------------------
+# A pure read, exactly like the unprivileged backend's tun-status: it starts and
+# stops nothing and needs no privileges. active follows the same rule as
+# read_tun_state — a live pid AND a name AND an interface — so the two readers
+# cannot disagree.
+cmd_status() {
+  local active=false profile="" iface="" pid="" since=0 err=""
+
+  if [[ -f $STATE_FILE ]]; then
+    profile="$(read_state_profile)"
+    iface="$(read_state_iface)"
+    pid="$(read_state_pid)"
+    since="$(jq -r 'if (.since|type)=="number" then (.since|floor) else 0 end' "$STATE_FILE" 2>/dev/null)"
+    [[ $since =~ ^[0123456789]+$ ]] || since=0
+    if [[ -n $pid ]] && pid_live "$pid" && [[ -n $profile && -n $iface ]]; then
+      active=true
+    fi
+  fi
+
+  if [[ $active != true ]]; then
+    # ONE "off" shape: no stale profile name, interface or pid next to false.
+    profile=""
+    iface=""
+    pid=""
+    since=0
+  fi
+
+  err="$(read_last_error)"
+
+  jq -n --argjson active "$active" --arg profileId "$profile" --arg iface "$iface" \
+        --arg pid "$pid" --argjson since "$since" --arg lastError "$err" \
+    '{ok:true, active:$active, profileId:$profileId, iface:$iface,
+      pid:$pid, since:$since, lastError:$lastError}'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Dispatch
+# -----------------------------------------------------------------------------
+case "${1:-}" in
+  up)     shift; cmd_up "${1:-}" ;;
+  down)   cmd_down ;;
+  status) cmd_status ;;
+  ""|-h|--help)
+    sed -n '/^# VERBS/,/^# DRY RUN/p' "$0" | sed 's/^# \?//' | grep -v '^$'
+    exit 0
+    ;;
+  *)
+    refuse "unknown verb: $1 (expected up <id>, down or status)"
+    ;;
+esac

@@ -52,10 +52,31 @@
 # path is overridable with OMARCHY_V2RAY_TUN_STATE, so tests can point it at a
 # temp dir without touching /run — the same reason OMARCHY_V2RAY_HOME exists.
 #
+# The helper also records WHY the last start failed in
+#
+#   /run/omarchy-v2ray-tun/last-error
+#
+# a one-line, already-flattened explanation (engine log tail, or the refusal
+# itself). `status` surfaces it as tunLastError so the panel can say "the engine
+# died" or "that profile is gone" instead of only that TUN is not up. It can
+# never explain a cancelled polkit prompt: when the helper does not run, nobody
+# is there to write the file — that belongs to the polkit slice.
+#
+# The helper that pkexec executes is installed OUTSIDE the plugin tree, at
+# /usr/local/lib/omarchy-v2ray/omarchy-v2ray-tun (root-owned, 0755), by
+# `install-tun`. The plugin tree is user-writable, so executing a helper from
+# there would make the "privileged half" replaceable by any process running as
+# the desktop user. Both sides check ownership before anything privileged.
+#
 # SUBCOMMANDS
 # -----------
 #   status              Engine/profile/connection state as one JSON object.
 #   tun-status          Read-only TUN state: can it start here, is it active.
+#   tun-up <id>         Start the system-wide TUN tunnel through pkexec.
+#                       Returns at once; the polkit prompt must not block the
+#                       panel (see cmd_tun_up).
+#   tun-down            Stop it (also through pkexec; idempotent).
+#   tun-toggle <id>     Down when active, otherwise up.
 #   list                Every imported profile as a JSON array.
 #   import              Read {id,meta,config} JSON on STDIN, write a profile.
 #                       (stdin only, on purpose: an argv or environment payload
@@ -71,6 +92,11 @@
 #   autostart [<id>|off] Get or set the profile that auto-connects.
 #   install-engine      Open a floating terminal that installs v2ray.
 #   install-xray        Open a floating terminal that installs xray from the AUR.
+#   install-tun         Install the privileged TUN helper to
+#                       /usr/local/lib/omarchy-v2ray through pkexec, in a
+#                       visible terminal. The helper must NEVER be executed from
+#                       the plugin tree (which the user owns) — see
+#                       cmd_install_tun.
 #   debug <id>          Verbose one-shot diagnosis: run the engine at debug
 #                       level, make one request, print the engine's own log.
 #   reveal              Open the config directory in the file manager.
@@ -106,6 +132,11 @@ AUTOSTART_FILE="$STATE_DIR/autostart.id"
 # The TUN state file is NOT under CONFIG_DIR: a root helper writes it (see the
 # LAYOUT ON DISK note), and it must be readable without touching the user tree.
 TUN_STATE_FILE="${OMARCHY_V2RAY_TUN_STATE:-/run/omarchy-v2ray-tun/state.json}"
+# The helper's directory, derived from the state path when only that one override
+# is given: both files live together, and a test that points at a temp dir must
+# not silently read /run for the error text.
+TUN_RUN_DIR="${OMARCHY_V2RAY_TUN_RUN_DIR:-${TUN_STATE_FILE%/*}}"
+TUN_LAST_ERROR_FILE="$TUN_RUN_DIR/last-error"
 
 # Default local proxy ports. The panel can override these per import through the
 # widget settings; these are only the fallback.
@@ -477,6 +508,125 @@ read_tun_state() {
   printf '%s' "$off"
 }
 
+# -----------------------------------------------------------------------------
+# tun_last_error — one flattened line explaining the helper's last failure.
+# -----------------------------------------------------------------------------
+tun_last_error() {
+  [[ -f $TUN_LAST_ERROR_FILE ]] || { printf ''; return 0; }
+  # Same clamping rule as read_tun_state: never fail, never leak a parse error
+  # into stdout, and never hand the panel unbounded text. The helper already
+  # writes one line; flattening here also covers a hand-edited file.
+  tr '\n\r' '  ' <"$TUN_LAST_ERROR_FILE" 2>/dev/null \
+    | head -c 400 \
+    | sed 's/  */ /g;s/^ //;s/ $//'
+}
+
+# -----------------------------------------------------------------------------
+# TUN helper path and the pre-flight check before pkexec.
+# -----------------------------------------------------------------------------
+# The helper is executed AS ROOT, so the file it names must not be writable by
+# the desktop user. The plugin itself lives in ~/.config/omarchy/plugins/, which
+# the user owns — a "privileged half" installed there would be trivial to
+# replace, and one pkexec password prompt later the replacement runs as root
+# (silently, once a polkit rule names that path). So the executed copy is
+# installed OUTSIDE the plugin tree, by `install-tun`, into a root-owned path.
+#
+# The environment override exists for tests. It is safe because the ownership
+# check applies to whatever path it names: pointing it at a user-owned file only
+# produces a refusal, never a prompt.
+# The INSTALL destination is a constant and is deliberately NOT overridable:
+# a root install must not take its target from the environment. The launch seam
+# below is only for pointing the launcher/tests at the file that already exists.
+TUN_HELPER_INSTALL_PATH=/usr/local/lib/omarchy-v2ray/omarchy-v2ray-tun
+TUN_HELPER_PATH="${OMARCHY_V2RAY_TUN_HELPER:-$TUN_HELPER_INSTALL_PATH}"
+
+# -----------------------------------------------------------------------------
+# tun_helper_problem — echo why the helper path is unsafe to hand to pkexec, or
+# nothing when it is usable.
+# -----------------------------------------------------------------------------
+# This is a PRE-FLIGHT, not the security boundary: it runs as the user, so a
+# check-then-exec race is possible in principle. The boundary is the identical
+# check the helper performs on its own $0 after pkexec has made it root; this
+# one exists so an uninstalled or user-owned helper produces an actionable
+# error instead of a password prompt followed by a failure.
+tun_helper_problem() {
+  local helper="${1:-}" owner mode
+  [[ -n $helper ]] || { printf '%s' "the TUN helper path is empty"; return 0; }
+  [[ $helper == /* ]] || { printf '%s' "the TUN helper path is not absolute"; return 0; }
+  # A symlink is refused even if it points at a root-owned file: the link lives
+  # in a directory whose owner chooses where it points.
+  [[ -L $helper ]] && { printf '%s' "the TUN helper is a symlink"; return 0; }
+  [[ -f $helper ]] || { printf '%s' "the TUN helper is not installed"; return 0; }
+  [[ -x $helper ]] || { printf '%s' "the TUN helper is not executable"; return 0; }
+
+  owner="$(stat -c '%u' -- "$helper" 2>/dev/null)" \
+    || { printf '%s' "the TUN helper cannot be inspected"; return 0; }
+  mode="$(stat -c '%a' -- "$helper" 2>/dev/null)" \
+    || { printf '%s' "the TUN helper cannot be inspected"; return 0; }
+  if [[ $owner != 0 ]]; then
+    printf 'the TUN helper (%s) is not owned by root (uid %s), so a user could replace the code that runs as root' \
+      "$helper" "$owner"
+    return 0
+  fi
+  if (( (8#$mode & 8#022) != 0 )); then
+    printf 'the TUN helper (%s) is group- or world-writable, so a user could replace the code that runs as root' \
+      "$helper"
+    return 0
+  fi
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# tun_helper_source_path — the repo/plugin copy of the helper, to be installed.
+# -----------------------------------------------------------------------------
+# This path IS user-writable, by design: it is the source that `root` copies into
+# place once, from a visible terminal showing the exact command. It must never be
+# the path pkexec executes (see TUN_HELPER_PATH).
+tun_helper_source_path() {
+  local self="$0" dir
+  # A bare name (found through PATH) has no slash; ask the shell where it found
+  # us. Nothing here trusts a value from the environment.
+  if [[ $self != */* ]]; then
+    self="$(command -v -- "$self" 2>/dev/null)" || return 1
+  fi
+  [[ -n $self ]] || return 1
+  dir="$(cd -- "$(dirname -- "$self")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/omarchy-v2ray-tun' "$dir"
+}
+
+# -----------------------------------------------------------------------------
+# launch_tun_helper VERB [ARG] — hand one request to pkexec and return at once.
+# -----------------------------------------------------------------------------
+# pkexec does not return until polkit has finished asking; the panel refreshes
+# on a timer and must not sit on a password prompt. So the helper is launched
+# fully detached (setsid, no tty, output discarded) and this script answers
+# immediately. The caller then polls `status` / `tun-status`, which reads the
+# state file the helper writes.
+#
+# `pkexec` is looked up by name on PATH here — that is the ONE program this
+# script is allowed to escalate through, and it is always given the installed,
+# checked helper path. There is no sudo fallback on purpose: sudo does not set
+# PKEXEC_UID, and the helper refuses to guess its identity.
+launch_tun_helper() {
+  local helper="$TUN_HELPER_PATH" verb="$1" id="${2:-}" problem
+  problem="$(tun_helper_problem "$helper")"
+  if [[ -n $problem ]]; then
+    # needsHelper is the panel's cue to offer "Install TUN helper" instead of a
+    # password prompt that cannot work. Never invoke pkexec on this path.
+    jq -n --arg error "$problem — install it with: omarchy-v2ray install-tun" \
+      '{ok:false, error:$error, needsHelper:true}'
+    exit 1
+  fi
+  command -v pkexec >/dev/null 2>&1 \
+    || emit_error "pkexec is not installed, so the TUN password cannot be requested (install polkit)"
+
+  if [[ -n $id ]]; then
+    setsid pkexec "$helper" "$verb" "$id" >/dev/null 2>&1 &
+  else
+    setsid pkexec "$helper" "$verb" >/dev/null 2>&1 &
+  fi
+}
+
 # free_port — find an unused local TCP port for a throwaway engine.
 # We start at 11080 to stay clear of the real proxy ports (10808/10809).
 free_port() {
@@ -604,6 +754,12 @@ cmd_status() {
     # "off means off" rule both `status` and `tun-status` share.
   fi
 
+  # The helper's own account of why the last start failed. Always a string
+  # (empty when there is nothing to say), so the panel can append it to the TUN
+  # row without a null check. Read-only: this never creates the helper's dir.
+  local tun_last_error
+  tun_last_error="$(tun_last_error)"
+
   jq -n \
     --argjson installed "$installed" \
     --arg engine "$engine" \
@@ -623,6 +779,7 @@ cmd_status() {
     --argjson tunSince "$tun_since" \
     --argjson tunCanStart "$tun_can_start" \
     --arg tunBlockedReason "$tun_blocked" \
+    --arg tunLastError "$tun_last_error" \
     '{
        ok: true,
        installed: $installed,
@@ -642,7 +799,8 @@ cmd_status() {
        tunIface: $tunIface,
        tunSince: $tunSince,
        tunCanStart: $tunCanStart,
-       tunBlockedReason: $tunBlockedReason
+       tunBlockedReason: $tunBlockedReason,
+       tunLastError: $tunLastError
      }'
   exit 0
 }
@@ -681,6 +839,64 @@ cmd_tun_status() {
        reason: $reason
      }'
   exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Subcommands: tun-up / tun-down / tun-toggle
+# -----------------------------------------------------------------------------
+# These are thin launchers, not implementations. Everything privileged happens
+# in bin/omarchy-v2ray-tun; everything here is validation the helper repeats
+# anyway (it must never trust a caller) plus the detached pkexec hand-off.
+cmd_tun_up() {
+  local id="${1:-}"
+  [[ -n $id ]] || emit_error "tun-up needs a profile id"
+  # Same rule as import: never let a crafted id escape PROFILES_DIR. The helper
+  # re-checks, because the process with root is the one that must not be fooled.
+  [[ $id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || emit_error "invalid profile id"
+  [[ $id != *".."* ]] || emit_error "invalid profile id"
+  profile_exists "$id" || emit_error "unknown profile: $id"
+
+  # v2ray-core has no tun inbound and accepts the key silently; say so here so
+  # the user is not sent through a password prompt for a tunnel that cannot
+  # exist. Same wording and same `needsXray` flag as the proxy-mode gate.
+  local engine reason
+  engine="$(engine_bin)"
+  reason="$(tun_engine_reason "$engine")"
+  if [[ -n $reason ]]; then
+    jq -n --arg error "$reason" '{ok:false, error:$error, needsXray:true}'
+    exit 1
+  fi
+
+  # Avoid a second polkit prompt (and a twin helper) when the helper's own
+  # flock would refuse anyway. A stale state file reads as inactive, so a dead
+  # tunnel never blocks a restart.
+  if [[ "$(jq -r '.active' <<<"$(read_tun_state)")" == true ]]; then
+    emit_error "TUN is already active; run tun-down first"
+  fi
+
+  launch_tun_helper up "$id"
+  # pkexec is still authenticating in the background. Answer now: the panel
+  # polls tun-status, which will flip when the helper writes its state file.
+  jq -n '{ok:true, launched:true, needsAuth:true}'
+  exit 0
+}
+
+cmd_tun_down() {
+  # Idempotent by construction: the helper exits 0 when nothing is running, and
+  # it must also work after the profile has been deleted, so there is nothing to
+  # validate here beyond finding the helper.
+  launch_tun_helper down
+  jq -n '{ok:true, launched:true}'
+  exit 0
+}
+
+cmd_tun_toggle() {
+  local id="${1:-}"
+  if [[ "$(jq -r '.active' <<<"$(read_tun_state)")" == true ]]; then
+    cmd_tun_down
+  fi
+  [[ -n $id ]] || emit_error "tun-toggle needs a profile id when TUN is not active"
+  cmd_tun_up "$id"
 }
 
 # -----------------------------------------------------------------------------
@@ -1586,6 +1802,101 @@ cmd_install_xray() {
 }
 
 # -----------------------------------------------------------------------------
+# Subcommand: install-tun
+# -----------------------------------------------------------------------------
+# Installs the PRIVILEGED helper outside the plugin tree.
+#
+# WHY THIS EXISTS: the plugin is installed under ~/.config/omarchy/plugins/,
+# which the desktop user owns. A helper that pkexec executes from there is not
+# privileged at all — any process running as that user can replace it and have
+# the replacement run as root on the next prompt (and silently once a polkit
+# rule names the path). So the executed copy lives at
+# /usr/local/lib/omarchy-v2ray/omarchy-v2ray-tun, root-owned and 0755, and both
+# this script and the helper check that before anything privileged happens.
+#
+# Like install-engine, the install runs in a VISIBLE terminal: pkexec needs a
+# password, this script has no TTY, and the user should see exactly what root is
+# about to copy. The command is shown in the terminal and in the JSON reply.
+cmd_install_tun() {
+  # THE DESTINATION IS A CONSTANT, NEVER $TUN_HELPER_PATH. That variable is a
+  # LAUNCH seam: it lets the launcher (and the tests) point at an already
+  # installed file. Using it here would let the environment choose what root
+  # overwrites — OMARCHY_V2RAY_TUN_HELPER=/etc/passwd would produce a root
+  # `install` over /etc/passwd. Installation and launching are different
+  # authorities, so they get different seams.
+  local dest="$TUN_HELPER_INSTALL_PATH" src owner mode install_cmd
+  local dir
+  dir="$(dirname -- "$dest")"
+
+  # Defence in depth: the owner/mode checks below would accept any root-owned
+  # file, so the path itself must be the fixed one.
+  [[ $dest == "$TUN_HELPER_INSTALL_PATH" ]] \
+    || emit_error "refusing to install to an unexpected path"
+
+  # Never overwrite something that is not already ours to overwrite. A symlink
+  # is refused even when it points at a root-owned file, because the link's
+  # directory decides where it points; a non-root-owned file may be a previous
+  # install the user should look at; a group/world-writable one is exactly the
+  # hazard this whole subcommand exists to remove.
+  [[ -L $dest ]] && emit_error "refusing to install over a symlink: $dest"
+  if [[ -e $dest ]]; then
+    [[ -f $dest ]] || emit_error "refusing to overwrite a non-regular file: $dest"
+    owner="$(stat -c '%u' -- "$dest" 2>/dev/null)" \
+      || emit_error "cannot inspect $dest"
+    mode="$(stat -c '%a' -- "$dest" 2>/dev/null)" \
+      || emit_error "cannot inspect $dest"
+    [[ $owner == 0 ]] \
+      || emit_error "refusing to overwrite $dest: it is not owned by root (uid $owner). Remove it yourself, then rerun"
+    (( (8#$mode & 8#022) == 0 )) \
+      || emit_error "refusing to overwrite $dest: it is group- or world-writable"
+  fi
+
+  # The INSTALL DIRECTORY is checked too: `install -D` creates a missing one but
+  # will happily write through a pre-existing directory that somebody else owns
+  # or can rewrite. `install -d` inside the pkexec chain fixes the mode/owner,
+  # but a bad existing directory must be reported, not silently "repaired" into
+  # a path the user never audited.
+  [[ -L $dir ]] && emit_error "refusing a symlinked install directory: $dir"
+  if [[ -e $dir ]]; then
+    [[ -d $dir ]] || emit_error "refusing to install into a non-directory: $dir"
+    owner="$(stat -c '%u' -- "$dir" 2>/dev/null)" \
+      || emit_error "cannot inspect the install directory"
+    mode="$(stat -c '%a' -- "$dir" 2>/dev/null)" \
+      || emit_error "cannot inspect the install directory"
+    [[ $owner == 0 ]] \
+      || emit_error "refusing to install into $dir: it is not owned by root (uid $owner)"
+    (( (8#$mode & 8#022) == 0 )) \
+      || emit_error "refusing to install into $dir: it is group- or world-writable"
+  fi
+
+  # The SOURCE is the plugin's own copy, which the user owns — that is expected:
+  # it is the file being installed, and root reads it once from a visible
+  # terminal. It is never the path pkexec executes.
+  src="$(tun_helper_source_path)" \
+    || emit_error "cannot locate bin/omarchy-v2ray-tun next to this script"
+  [[ -f $src ]] || emit_error "the TUN helper source is missing: $src"
+  [[ -x $src ]] || emit_error "the TUN helper source is not executable: $src"
+
+  # ONE pkexec, so the user sees one password prompt and one auditable line:
+  # `install -d` forces the parent to root:root 0755 (repairing a missing tree),
+  # then `install -Dm755` writes the helper. Both paths are %q-quoted for the
+  # terminal's shell; the plugin directory is user-controlled and may contain
+  # spaces.
+  install_cmd="pkexec /bin/sh -c $(printf '%q' \
+    "install -d -o root -g root -m 0755 $(printf '%q' "$dir") && install -Dm755 $(printf '%q' "$src") $(printf '%q' "$dest")")"
+
+  local launcher="omarchy-launch-floating-terminal-with-presentation"
+  if command -v "$launcher" >/dev/null 2>&1; then
+    setsid "$launcher" "$install_cmd" >/dev/null 2>&1 &
+  else
+    setsid xdg-terminal-exec "$install_cmd" >/dev/null 2>&1 &
+  fi
+  jq -n --arg helper "$dest" --arg command "$install_cmd" \
+    '{ok:true, launched:true, needsAuth:true, helper:$helper, command:$command}'
+  exit 0
+}
+
+# -----------------------------------------------------------------------------
 # Subcommand: reveal
 # -----------------------------------------------------------------------------
 cmd_reveal() {
@@ -1600,6 +1911,9 @@ cmd_reveal() {
 case "${1:-}" in
   status)         cmd_status ;;
   tun-status)     cmd_tun_status ;;
+  tun-up)         shift; cmd_tun_up "${1:-}" ;;
+  tun-down)       cmd_tun_down ;;
+  tun-toggle)     shift; cmd_tun_toggle "${1:-}" ;;
   list)           cmd_list ;;
   import)         shift; cmd_import "$@" ;;
   remove)         shift; cmd_remove "$@" ;;
@@ -1613,6 +1927,7 @@ case "${1:-}" in
   autostart)      shift; cmd_autostart "$@" ;;
   install-engine) cmd_install_engine ;;
   install-xray)   cmd_install_xray ;;
+  install-tun)    cmd_install_tun ;;
   debug)          shift; cmd_debug "${1:-}" ;;
   reveal)         cmd_reveal ;;
   version)        echo "$VERSION" ;;

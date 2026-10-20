@@ -479,10 +479,10 @@ check "a world-listable state dir is repaired to 0700"    test "$(stat -c %a "$P
 echo
 echo "case 0e: TUN is observed, never started"
 # TUN mode is a system-wide tunnel and needs CAP_NET_ADMIN, so the half that
-# creates it is privileged and does not exist yet. This slice only teaches the
-# backend to READ the root-written state file and to answer "can TUN start
-# here?"; these cases pin that it is a pure query: always valid JSON, never a
-# crash, and always "not active" when the file cannot be trusted.
+# creates it is privileged and lives in bin/omarchy-v2ray-tun, not here. This
+# half only READS the root-written state file and answers "can TUN start here?";
+# these cases pin that it is a pure query: always valid JSON, never a crash, and
+# always "not active" when the file cannot be trusted.
 TUN_STATE="$WORK/tun/state.json"
 mkdir -p "$WORK/tun"
 tun_status() { OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" "$BACKEND" tun-status 2>/dev/null; }
@@ -667,12 +667,29 @@ check "with only v2ray installed, tunCanStart is false" jq -e \
 check_contains "and status names the same fix" "$(jq -r '.tunBlockedReason' <<<"$out")" \
   "omarchy pkg aur add xray"
 
-# The privileged half is a LATER slice. A stub that silently succeeded would let
-# the UI believe TUN could be switched and would hide the missing work.
-for verb in tun-up tun-down; do
-  out="$("$BACKEND" "$verb" 2>/dev/null)"
-  check "$verb does not exist yet" jq -e '.ok == false and (.error | contains("unknown subcommand"))' <<<"$out"
-done
+# The privileged half exists in a later slice, but it is NOT installed by this
+# suite (and must not be: that needs pkexec). What matters here is the contract:
+# with no root-owned helper installed, tun-down refuses with needsHelper and
+# never asks for a password, and a missing id is refused before any of that. A
+# recording pkexec double proves the second half.
+PKEBIN="$WORK/pkexec-bin"
+mkdir -p "$PKEBIN"
+cat >"$PKEBIN/pkexec" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$PKEXEC_ARGS"
+SH
+chmod +x "$PKEBIN/pkexec"
+
+out="$("$BACKEND" tun-up 2>/dev/null)"
+check "tun-up without an id is refused" \
+  jq -e '.ok == false and (.error | contains("needs a profile id"))' <<<"$out"
+
+rm -f "$WORK/pkexec.args"
+PKEXEC_ARGS="$WORK/pkexec.args" PATH="$PKEBIN:$PATH" "$BACKEND" tun-down >"$WORK/tun-down.json" 2>/dev/null
+check "tun-down asks for the helper install instead of prompting" \
+  jq -e '.ok == false and .needsHelper == true and (.error | contains("install-tun"))' <"$WORK/tun-down.json"
+check "tun-down did not invoke pkexec without a checked helper" \
+  test ! -e "$WORK/pkexec.args"
 
 # =============================================================================
 echo
