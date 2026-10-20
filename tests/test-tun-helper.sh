@@ -245,8 +245,14 @@ if [[ $HAVE_XRAY == true ]]; then
   # and no direct-range route lines at all. The fixture profile's outbound is
   # literal, so there is no pin step to show — the same no-op the real run
   # performs.
+  # The plan must show the ACTUAL bind program, not merely some sockopt
+  # mention: the constant is one definition with two call sites (bind and
+  # plan), so the planned program literally contains `.streamSettings.sockopt`
+  # — the top-level-`.sockopt` shape that once drifted would fail both checks.
   check_contains "the plan binds the direct outbound to the uplink" \
-    "$flat" "sockopt"
+    "$flat" ".streamSettings.sockopt // {}"
+  check_not_contains "the planned program is not the drift-prone top-level shape" \
+    "$flat" "{sockopt: ((.sockopt"
   check_contains "the bind names the detected uplink device" \
     "$flat" "jq --arg iface "
   check_not_contains "no direct-range route is planned" "$flat" \
@@ -346,7 +352,10 @@ echo "case 1b: routing internals without root (socket binding, pinning, failure 
 #     direct call can prove them.
 { sed -n '/^route_field_after()/,/^start_engine()/p' "$HELPER" | head -n -1
   sed -n '/^pin_server_address()/,/^route_field_after()/p' "$HELPER" | head -n -1
-  sed -n '/^helper_log()/,/^}/p' "$HELPER"; } >"$WORK/routing-funcs.sh"
+  sed -n '/^helper_log()/,/^}/p' "$HELPER"
+  # The bind program is one constant in the helper; the driver must run the
+  # SAME definition (scenario H calls bind_direct_outbound), not a hand copy.
+  grep '^BIND_JQ=' "$HELPER"; } >"$WORK/routing-funcs.sh"
 cat >"$WORK/routing-unit.sh" <<'SH'
 set -uo pipefail
 source "$1"

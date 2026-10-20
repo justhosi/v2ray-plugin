@@ -212,6 +212,14 @@ ENGINE_ALLOWLIST=(
 # uplink explicitly (sockopt.interface, see bind_direct_outbound).
 TUN_INBOUND_JQ='.inbounds = (((.inbounds // []) | map(select(.protocol != "tun"))) + [{tag:"tun-in",protocol:"tun",settings:{name:$iface,mtu:1500,gateway:["10.66.0.1/16","fc00:66::1/64"],autoSystemRoutingTable:["0.0.0.0/1","128.0.0.0/1","::/1","8000::/1"],autoOutboundsInterface:"auto"}}])'
 
+# The rewrite that keeps the `direct` (freedom) outbound off the tun at the
+# socket level (see bind_direct_outbound). ONE definition, TWO call sites:
+# bind_direct_outbound executes this program and plan_up mirrors it, so the
+# plan shows the program that actually runs and the two cannot drift apart
+# again (the mirror once showed a top-level .sockopt while the real run
+# rewrote .streamSettings.sockopt, silently dropping other sockopt keys).
+BIND_JQ='(.outbounds // []) |= map(if (.protocol // "") == "freedom" then (.streamSettings = ((.streamSettings // {}) + {sockopt: ((.streamSettings.sockopt // {}) + {interface: $iface})})) else . end)'
+
 # Set once the engine is our child; used by every teardown path.
 ENGINE_PID=""
 # Set once we have actually changed DNS; the supervisor and every failure path
@@ -812,13 +820,7 @@ bind_direct_outbound() {
     || { helper_log "bind: no uplink was detected before the start"; return 1; }
   local tmp
   tmp="$RUN_DIR/.config.json.$$"
-  jq --arg iface "$UPLINK_DEV" '
-      (.outbounds // []) |= map(
-        if (.protocol // "") == "freedom"
-        then
-          .streamSettings = ((.streamSettings // {})
-            + {sockopt: ((.streamSettings.sockopt // {}) + {interface: $iface})})
-        else . end)' \
+  jq --arg iface "$UPLINK_DEV" "$BIND_JQ" \
     "$CONFIG_FILE" >"$tmp" 2>/dev/null \
     || { rm -f -- "$tmp"; helper_log "bind: rewriting the direct outbound failed"; return 1; }
   [[ -s $tmp ]] \
@@ -1491,9 +1493,7 @@ plan_up() {
   # lines exist for the direct ranges at all. $plan_tmp is reused here exactly
   # as for the pin mirror; the real run's temp name carries its own pid.
   if [[ -n $UPLINK_DEV ]]; then
-    dry_cmd jq --arg iface "$UPLINK_DEV" \
-      '(.outbounds // []) |= map(if (.protocol // "") == "freedom" then (.streamSettings = ((.streamSettings // {}) + {sockopt: ((.sockopt // {}) + {interface: $iface})})) else . end)' \
-      -- "$CONFIG_FILE"
+    dry_cmd jq --arg iface "$UPLINK_DEV" "$BIND_JQ" -- "$CONFIG_FILE"
     dry_cmd chown "$INVOKER_UID:$INVOKER_GID" -- "$plan_tmp"
     dry_cmd chmod 0600 -- "$plan_tmp"
     dry_cmd mv -f -- "$plan_tmp" "$CONFIG_FILE"
