@@ -20,12 +20,13 @@ import "Model.js" as Model
 //   left click on a row        connect (or disconnect if it is connected)
 //   right click on a row       copy that server's original share link
 //   the three row buttons      ping · copy link · delete (click twice)
+//   the TUN switch             system-wide tunnel (one polkit prompt)
 //
 //   typing in the field        types; Enter imports the link
 //   Escape                     close
 //   Tab                        leave the field and drive the list by keyboard
 //   Up/Down, Enter             move and activate the row cursor
-//   t / r / p / c              toggle · refresh · ping · copy
+//   t / u / r / p / c          toggle · TUN · refresh · ping · copy
 //
 // All state and all process spawning live in Service.qml. This file only draws
 // and forwards intent, which is why it has no Process items of its own except
@@ -137,6 +138,33 @@ Panel {
     var profile = cursorProfile()
     if (profile) v2ray.copyLink(profile.id)
   }
+
+  // ---------------------------------------------------------------------------
+  // TUN (system-wide) — the one line under the switch.
+  // ---------------------------------------------------------------------------
+  // Ordered by what the user can act on: a move in flight beats everything (the
+  // switch is pulsing, and this is why), then the live tunnel, then the reason
+  // the switch is disabled, then the offer.
+  function tunDetail() {
+    if (v2ray.tunArming) return "Waiting for authorisation…"
+    if (v2ray.tunActive) {
+      return "All traffic is tunnelled via " + (v2ray.tunIface || "the tun device") +
+             ". Turn off to restore normal routing."
+    }
+    if (!v2ray.tunCanStart) {
+      return v2ray.tunBlockedReason !== ""
+        ? v2ray.tunBlockedReason
+        : "TUN mode is not available on this machine."
+    }
+    return "Routes all traffic through the tunnel. Needs the privileged helper and the xray core."
+  }
+
+  // The backend answers needsHelper when the installed helper is missing or
+  // unsafe to run, and never asks for a password in that case. ONLY that answer
+  // drives the row: matching "install-tun" inside any helper error made the row
+  // sticky, because the error file survives a successful retry's start-up until
+  // the helper deletes it.
+  readonly property bool tunHelperMissing: v2ray.tunNeedsHelper
 
   // Delete via the keyboard needs the same two-step guard as the mouse, so a
   // stray Delete keypress cannot silently drop a server.
@@ -253,6 +281,9 @@ Panel {
           busy: v2ray.busy
           crossed: !v2ray.connected && !v2ray.busy
           warning: !v2ray.installed
+          // A local proxy and a system-wide tunnel are both "on", so the bar
+          // needs the second, quieter signal to tell them apart.
+          mode: v2ray.mode
         }
       }
     }
@@ -288,6 +319,7 @@ Panel {
       onDeleteRequested: root.deleteCursor()
       onTextKey: function(t) {
         if (t === "t" || t === "T") v2ray.toggleConnection()
+        else if (t === "u" || t === "U") v2ray.tunToggle()
         else if (t === "r" || t === "R") v2ray.refresh()
         else if (t === "p" || t === "P") root.pingCursor()
         else if (t === "c" || t === "C") root.copyCursorLink()
@@ -328,6 +360,7 @@ Panel {
                 busy: v2ray.busy
                 crossed: !v2ray.connected && !v2ray.busy
                 warning: !v2ray.installed
+                mode: v2ray.mode
               }
             }
             trailingControl: Component {
@@ -593,11 +626,16 @@ Panel {
             // This paragraph exists to kill the most common misreading of the
             // whole plugin: the tunnel is ON, yet a browser still reports the
             // real IP, because nothing told the browser to use the proxy.
+            // In TUN mode that is no longer true — everything is rerouted — and
+            // saying it would be actively wrong. The ports stay bound either
+            // way, so the section itself is never hidden.
             Text {
               width: parent.width
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
-              text: "This proxy is NOT system-wide. Only apps you point at it go through the tunnel, so a browser that was never configured still shows your real IP. Either set SOCKS5 127.0.0.1:" + v2ray.socksPort + " in the app's proxy settings, or copy the line below and start the app from a terminal that has it."
+              text: v2ray.mode === "tun"
+                ? "TUN mode already routes every app, so nothing has to be pointed here. These ports stay bound for apps that prefer an explicit proxy."
+                : "This proxy is NOT system-wide. Only apps you point at it go through the tunnel, so a browser that was never configured still shows your real IP. Either set SOCKS5 127.0.0.1:" + v2ray.socksPort + " in the app's proxy settings, or copy the line below and start the app from a terminal that has it."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -613,6 +651,98 @@ Panel {
               onClicked: {
                 root.flash("proxy-env")
                 v2ray.copyProxyEnvironment()
+              }
+            }
+          }
+
+          // ---- TUN (system-wide) -------------------------------------------
+          // A second kind of tunnel: the privileged helper sends every packet on
+          // the machine through the profile, so this is the only switch here
+          // that asks for a password. Hidden only when there is no core at all,
+          // where the install block above is the whole story.
+          Column {
+            visible: v2ray.installed || v2ray.tunActive || root.tunHelperMissing
+            width: parent.width
+            spacing: Style.space(4)
+
+            PanelSeparator { foreground: root.foreground }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              PanelSectionHeader {
+                text: "TUN (SYSTEM-WIDE)"
+                width: parent.width - tunSwitch.width - parent.spacing
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              ToggleSwitch {
+                id: tunSwitch
+                // Bound to the REAL state, never to the click. The helper has to
+                // authenticate first, so a knob that flips immediately and flips
+                // back on a cancelled prompt would be a lie. While arming it
+                // pulses instead; `interactive` is what makes it disabled.
+                checked: v2ray.tunActive
+                busy: v2ray.tunArming
+                interactive: !v2ray.tunArming && (v2ray.tunCanStart || v2ray.tunActive)
+                foreground: root.foreground
+                accent: Color.accent
+                onToggled: v2ray.tunToggle()
+
+                // ToggleSwitch's `busy` only swallows clicks, so the pulse is
+                // ours. A SequencedAnimation REPLACES the property while it
+                // runs, so onStopped has to put it back — a stopped animation
+                // leaves its target halfway (same rule as V2rayActionButton).
+                SequentialAnimation on opacity {
+                  running: v2ray.tunArming
+                  loops: Animation.Infinite
+                  NumberAnimation { from: 1.0; to: 0.35; duration: 450; easing.type: Easing.InOutQuad }
+                  NumberAnimation { from: 0.35; to: 1.0; duration: 450; easing.type: Easing.InOutQuad }
+                  onStopped: tunSwitch.opacity = 1.0
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: root.tunDetail()
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            // Offered instead of a password prompt that cannot work: the
+            // backend only answers needsHelper when the installed copy is
+            // missing, a symlink, or not root-owned.
+            Row {
+              visible: root.tunHelperMissing
+              width: parent.width
+              spacing: Style.space(6)
+
+              V2rayActionButton {
+                iconText: "󰇚"
+                tooltipText: "Install the TUN helper"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                confirmed: root.flashKey === "tun-install"
+                onClicked: {
+                  root.flash("tun-install")
+                  v2ray.installTun()
+                }
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "Install the TUN helper"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
               }
             }
           }

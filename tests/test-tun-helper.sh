@@ -107,6 +107,15 @@ printf '%s\n' "\$*" >>"$WORK/pkexec.args"
 SH
 chmod +x "$FAKEBIN/pkexec"
 
+# The terminal launcher, doubled for the same reason: `install-tun` hands its
+# command to a visible terminal, and a test must never open one. `install-engine`
+# and `install-xray` find this too, but no case here calls them.
+cat >"$FAKEBIN/omarchy-launch-floating-terminal-with-presentation" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$WORK/launcher.args"
+SH
+chmod +x "$FAKEBIN/omarchy-launch-floating-terminal-with-presentation"
+
 # --------------------------------------------------------------- fixtures ----
 # A profile in the shape the panel imports: a SOCKS inbound (the readiness probe
 # uses its port) plus one outbound. The credential is a sentinel so the cases
@@ -426,6 +435,15 @@ if [[ $EUID -eq 0 && $HAVE_XRAY == true ]]; then
   chown 0:0 "$root_helper"
   chmod 755 "$root_helper"
   rm -f "$WORK/pkexec.args"
+
+  # A proxy engine the launch has to hand the ports over from. It must be a real,
+  # live process the launcher is allowed to signal, so it is a private sleep and
+  # not this suite's own pid (which read_pid would happily SIGTERM).
+  mkdir -p "$CONFIG_HOME/state"
+  sleep 60 & PROXY_PID=$!
+  echo "$PROXY_PID" >"$CONFIG_HOME/state/engine.pid"
+  echo "$ID" >"$CONFIG_HOME/state/active.id"
+
   out="$(OMARCHY_V2RAY_TUN_HELPER="$root_helper" "$BACKEND" tun-up "$ID" 2>/dev/null)"; rc=$?
   check "a root-owned helper is launched" \
     jq -e '.ok == true and .launched == true and .needsAuth == true' <<<"$out"
@@ -435,6 +453,14 @@ if [[ $EUID -eq 0 && $HAVE_XRAY == true ]]; then
   done
   check_contains "pkexec receives the checked helper and the id" \
     "$(cat "$WORK/pkexec.args" 2>/dev/null)" "$root_helper up $ID"
+  # The port-collision fix, observed rather than read: the privileged config
+  # keeps the profile's SOCKS/HTTP inbounds, so the user-side engine must be gone
+  # before the helper starts one that would fight it for 10808.
+  check "tun-up stopped the proxy engine it is replacing" \
+    test ! -e "$CONFIG_HOME/state/engine.pid"
+  check "and forgot the profile the proxy engine was running" \
+    test ! -e "$CONFIG_HOME/state/active.id"
+  kill "$PROXY_PID" 2>/dev/null || true
 else
   printf '  SKIP the positive launch (needs a root-owned helper; run the suite as root)\n'
 fi
@@ -454,6 +480,76 @@ check "a user-owned helper copy exits 1" test "$rc" -eq 1
 check "the copy's refusal is ok:false" jq -e '.ok == false' <<<"$out"
 check "the copy's refusal names install-tun" jq -e '.error | contains("omarchy-v2ray install-tun")' <<<"$out"
 check "the copy touched no run directory" test ! -e "$untouched_run"
+
+# =============================================================================
+echo
+echo "case 11: install-tun takes its destination from the constant, never the environment"
+# Two DIFFERENT authorities share one name in this script, and this case is the
+# line between them:
+#
+#   OMARCHY_V2RAY_TUN_HELPER        a LAUNCH seam — lets the launcher (and these
+#                                   tests) point at an already-installed helper.
+#   TUN_HELPER_INSTALL_PATH         the INSTALL destination, a constant.
+#
+# If install-tun read the environment, then
+# OMARCHY_V2RAY_TUN_HELPER=/etc/passwd install-tun would ask root to `install`
+# the helper over /etc/passwd. So the destination is asserted on the recorded
+# launcher argv — the exact command root will see — rather than by trusting the
+# JSON field the same code produced.
+#
+# The terminal launcher is the recording double from above, so no window opens
+# and the assertion reads a file, never a timing window.
+INSTALL_DEST="/usr/local/lib/omarchy-v2ray/omarchy-v2ray-tun"
+# Deliberately under a directory that does not exist. A destination inside an
+# existing, user-owned directory would be refused by install-tun's separate
+# "the install directory must be root-owned" check, and a regression in the
+# destination line would then be caught by THAT check instead of by this case —
+# which is the difference between a test that fails and one that quietly skips.
+EVIL_DEST="$WORK/no-such-install-dir/attacker-dest"
+# What tun_helper_source_path resolves the repo copy to (it uses `pwd -P`, so a
+# path spelled with ".." would not compare equal).
+HELPER_SRC="$(cd "$HERE/../bin" && pwd -P)/omarchy-v2ray-tun"
+
+rm -f "$WORK/launcher.args"
+out="$(OMARCHY_V2RAY_TUN_HELPER="$EVIL_DEST" "$BACKEND" install-tun 2>/dev/null)"
+if jq -e '.ok == true' <<<"$out" >/dev/null 2>&1; then
+  check "install-tun reports the constant destination, not the override" \
+    jq -e --arg dest "$INSTALL_DEST" '.helper == $dest' <<<"$out"
+  # The launcher is detached (setsid), so the recording lands a moment after the
+  # backend exits. Waiting for a file that MUST appear is not a timing assertion:
+  # it cannot turn a broken command into a pass, and once it exists every check
+  # below is made against exact bytes.
+  for _ in $(seq 1 40); do
+    [[ -s "$WORK/launcher.args" ]] && break
+    sleep 0.05
+  done
+  check "the install was handed to the terminal launcher" test -s "$WORK/launcher.args"
+  check_contains "the recorded command names the installed path" \
+    "$(cat "$WORK/launcher.args")" "$INSTALL_DEST"
+  check_not_contains "the recorded command never names the environment override" \
+    "$(cat "$WORK/launcher.args")" "$EVIL_DEST"
+  check_contains "the install still goes through pkexec" \
+    "$(cat "$WORK/launcher.args")" "pkexec /bin/sh -c"
+  check_contains "and copies the repo helper as its source" \
+    "$(cat "$WORK/launcher.args")" "$HELPER_SRC"
+  check_not_contains "the source is not the environment-named file either" \
+    "$(cat "$WORK/launcher.args")" "$EVIL_DEST"
+else
+  # A refusal is only excusable when it is a fact about THIS machine — a
+  # destination left behind by a real install that this user may not overwrite.
+  # Anything else (notably "refusing to install to an unexpected path") means the
+  # destination stopped being the constant, which is exactly what this case
+  # exists to catch, so it must FAIL rather than quietly skip.
+  refusal="$(jq -r '.error // ""' <<<"$out")"
+  if [[ $refusal == *"not owned by root"* || $refusal == *"group- or world-writable"* \
+        || $refusal == *"symlink"* || $refusal == *"non-directory"* \
+        || $refusal == *"non-regular"* ]]; then
+    printf '  SKIP install-tun (%s)\n' "$refusal"
+  else
+    printf '  FAIL install-tun refused for a reason that is not a local condition: %s\n' "${refusal:-no JSON}"
+    failures=$((failures + 1))
+  fi
+fi
 
 # =============================================================================
 echo

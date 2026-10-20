@@ -522,6 +522,16 @@ tun_last_error() {
 }
 
 # -----------------------------------------------------------------------------
+# tun_is_active — true when the root helper has a live TUN tunnel.
+# -----------------------------------------------------------------------------
+# One predicate for the four places that must agree about it (tun-up, tun-toggle
+# and the start/toggle refusals). read_tun_state already drops a stale pid, so a
+# dead tunnel never blocks anything.
+tun_is_active() {
+  [[ "$(jq -r '.active' <<<"$(read_tun_state)")" == true ]]
+}
+
+# -----------------------------------------------------------------------------
 # TUN helper path and the pre-flight check before pkexec.
 # -----------------------------------------------------------------------------
 # The helper is executed AS ROOT, so the file it names must not be writable by
@@ -595,6 +605,28 @@ tun_helper_source_path() {
 }
 
 # -----------------------------------------------------------------------------
+# require_tun_helper — print the refusal and exit 1 when the helper may not be
+# handed to pkexec; return 0 when it may.
+# -----------------------------------------------------------------------------
+# Split out of launch_tun_helper because `tun-up` has to ask this question
+# BEFORE it stops the user's proxy engine: a missing helper must leave the
+# working tunnel alone, and only a launch that can actually happen is allowed
+# to have side effects.
+require_tun_helper() {
+  local helper="$TUN_HELPER_PATH" problem
+  problem="$(tun_helper_problem "$helper")"
+  if [[ -n $problem ]]; then
+    # needsHelper is the panel's cue to offer "Install TUN helper" instead of a
+    # password prompt that cannot work. Never invoke pkexec on this path.
+    jq -n --arg error "$problem — install it with: omarchy-v2ray install-tun" \
+      '{ok:false, error:$error, needsHelper:true}'
+    exit 1
+  fi
+  command -v pkexec >/dev/null 2>&1 \
+    || emit_error "pkexec is not installed, so the TUN password cannot be requested (install polkit)"
+}
+
+# -----------------------------------------------------------------------------
 # launch_tun_helper VERB [ARG] — hand one request to pkexec and return at once.
 # -----------------------------------------------------------------------------
 # pkexec does not return until polkit has finished asking; the panel refreshes
@@ -608,17 +640,8 @@ tun_helper_source_path() {
 # checked helper path. There is no sudo fallback on purpose: sudo does not set
 # PKEXEC_UID, and the helper refuses to guess its identity.
 launch_tun_helper() {
-  local helper="$TUN_HELPER_PATH" verb="$1" id="${2:-}" problem
-  problem="$(tun_helper_problem "$helper")"
-  if [[ -n $problem ]]; then
-    # needsHelper is the panel's cue to offer "Install TUN helper" instead of a
-    # password prompt that cannot work. Never invoke pkexec on this path.
-    jq -n --arg error "$problem — install it with: omarchy-v2ray install-tun" \
-      '{ok:false, error:$error, needsHelper:true}'
-    exit 1
-  fi
-  command -v pkexec >/dev/null 2>&1 \
-    || emit_error "pkexec is not installed, so the TUN password cannot be requested (install polkit)"
+  local verb="$1" id="${2:-}"
+  require_tun_helper
 
   if [[ -n $id ]]; then
     setsid pkexec "$helper" "$verb" "$id" >/dev/null 2>&1 &
@@ -701,6 +724,10 @@ cmd_status() {
   local engine installed=false running=false listening=false
   local pid active_id active_name="" socks="" http="" uptime=0 autostart=""
   local started=0 now=0
+  # Which kind of connection the fields below describe: "tun", "proxy" or "off".
+  # The panel needs this to label the connection honestly; the rest of the object
+  # is deliberately unchanged, so every existing caller keeps working.
+  local mode="off"
 
   engine="$(engine_bin)"
   [[ -n $engine ]] && installed=true
@@ -708,27 +735,6 @@ cmd_status() {
   pid="$(read_pid)"
   active_id="$( [[ -f $ACTIVE_FILE ]] && tr -d '\n' <"$ACTIVE_FILE" || echo "" )"
   autostart="$( [[ -f $AUTOSTART_FILE ]] && tr -d '\n' <"$AUTOSTART_FILE" || echo "" )"
-
-  if [[ -n $pid ]]; then
-    running=true
-    if [[ -n $active_id && -f "$(config_path "$active_id")" ]]; then
-      # Ports are read back from the profile that is actually running, so the
-      # UI can show "SOCKS 127.0.0.1:10808" without duplicating our defaults.
-      socks="$(jq -r '.inbounds[0].port // empty' "$(config_path "$active_id")" 2>/dev/null)"
-      http="$(jq -r '.inbounds[1].port // empty' "$(config_path "$active_id")" 2>/dev/null)"
-    fi
-    listening=false
-    [[ -n $socks ]] && port_listening "$socks" && listening=true
-    [[ -f $STARTED_FILE ]] && started="$(tr -dc '0-9' <"$STARTED_FILE")"
-    now="$(date +%s)"
-    [[ -n $started ]] && uptime=$((now - started))
-  else
-    running=false
-  fi
-
-  if [[ -n $active_id && -f "$(meta_path "$active_id")" ]]; then
-    active_name="$(jq -r '.name // ""' "$(meta_path "$active_id")" 2>/dev/null)"
-  fi
 
   # TUN is a second, system-wide tunnel. Its state comes from the root-written
   # file (read_tun_state never fails), and `tunCanStart` is the panel's gate for
@@ -754,6 +760,66 @@ cmd_status() {
     # "off means off" rule both `status` and `tun-status` share.
   fi
 
+  if [[ -n $pid ]]; then
+    running=true
+    mode="proxy"
+    if [[ -n $active_id && -f "$(config_path "$active_id")" ]]; then
+      # Ports are read back from the profile that is actually running, so the
+      # UI can show "SOCKS 127.0.0.1:10808" without duplicating our defaults.
+      socks="$(jq -r '.inbounds[0].port // empty' "$(config_path "$active_id")" 2>/dev/null)"
+      http="$(jq -r '.inbounds[1].port // empty' "$(config_path "$active_id")" 2>/dev/null)"
+    fi
+    listening=false
+    [[ -n $socks ]] && port_listening "$socks" && listening=true
+    [[ -f $STARTED_FILE ]] && started="$(tr -dc '0-9' <"$STARTED_FILE")"
+    now="$(date +%s)"
+    [[ -n $started ]] && uptime=$((now - started))
+  else
+    running=false
+  fi
+
+  # ONE SOURCE OF TRUTH FOR "CONNECTED" — and TUN wins.
+  #
+  # The panel derives its connected state from running/activeId/listening, and
+  # gates `start`/`toggle` on the same fields. The TUN engine is a different
+  # process with its own state file, so reporting only the proxy engine would
+  # paint "Disconnected" while every packet on the machine was inside the
+  # tunnel — and then invite a connect click that starts a second engine
+  # competing for 10808. So while TUN is active it IS the connection, and the
+  # fields are overwritten here, after the proxy branch, so exactly one set of
+  # values ever leaves this function.
+  if [[ $tun_active == true ]]; then
+    mode="tun"
+    running=true
+    # `listening` means "the connection is live", not "a local port answers".
+    # The helper only writes state.json after it has seen the profile's SOCKS
+    # port listening inside the tunnel, so this is a fact rather than a guess;
+    # re-probing the port here would just report a healthy tunnel as "engine
+    # starting" during the seconds before it binds.
+    listening=true
+    pid="$(jq -r '.pid' <<<"$tun")"
+    active_id="$tun_profile"
+    socks=""
+    http=""
+    # The TUN engine runs the same config with a tun inbound added, so the
+    # profile's proxy ports are still the ones bound and still worth showing.
+    if [[ -n $active_id && -f "$(config_path "$active_id")" ]]; then
+      socks="$(jq -r '.inbounds[0].port // empty' "$(config_path "$active_id")" 2>/dev/null)"
+      http="$(jq -r '.inbounds[1].port // empty' "$(config_path "$active_id")" 2>/dev/null)"
+    fi
+    uptime=0
+    if [[ $tun_since -gt 0 ]]; then
+      uptime=$(( $(date +%s) - tun_since ))
+      # A clock step backwards (or a state file written by a machine whose clock
+      # was ahead) must not paint a negative uptime.
+      (( uptime < 0 )) && uptime=0
+    fi
+  fi
+
+  if [[ -n $active_id && -f "$(meta_path "$active_id")" ]]; then
+    active_name="$(jq -r '.name // ""' "$(meta_path "$active_id")" 2>/dev/null)"
+  fi
+
   # The helper's own account of why the last start failed. Always a string
   # (empty when there is nothing to say), so the panel can append it to the TUN
   # row without a null check. Read-only: this never creates the helper's dir.
@@ -773,6 +839,7 @@ cmd_status() {
     --argjson uptimeSec "$uptime" \
     --arg autostartId "$autostart" \
     --arg logTail "$(last_log_lines 3)" \
+    --arg mode "$mode" \
     --argjson tunActive "$tun_active" \
     --arg tunProfileId "$tun_profile" \
     --arg tunIface "$tun_iface" \
@@ -786,6 +853,7 @@ cmd_status() {
        engine: $engine,
        running: $running,
        listening: $listening,
+       mode: $mode,
        pid: $pid,
        activeId: $activeId,
        activeName: $activeName,
@@ -870,9 +938,25 @@ cmd_tun_up() {
   # Avoid a second polkit prompt (and a twin helper) when the helper's own
   # flock would refuse anyway. A stale state file reads as inactive, so a dead
   # tunnel never blocks a restart.
-  if [[ "$(jq -r '.active' <<<"$(read_tun_state)")" == true ]]; then
+  if tun_is_active; then
     emit_error "TUN is already active; run tun-down first"
   fi
+
+  # The helper must be usable BEFORE the user's working tunnel is touched: a
+  # missing helper has to leave the proxy engine running and answer needsHelper.
+  require_tun_helper
+
+  # Hand the local ports over to the privileged engine.
+  #
+  # WHY THIS IS HERE AT ALL: the TUN config is the profile's config with a tun
+  # inbound added, so it still carries the profile's SOCKS/HTTP inbounds. If the
+  # unprivileged engine is already running it owns 10808/10809, the privileged
+  # one cannot bind, and it dies inside the helper's 10-second readiness wait —
+  # surfacing as "the engine exited while the tunnel was starting", which says
+  # nothing about the port collision that actually caused it. stop_engine needs
+  # no privilege (same uid), so doing it here makes the handover explicit:
+  # exactly one engine per profile at a time.
+  stop_engine
 
   launch_tun_helper up "$id"
   # pkexec is still authenticating in the background. Answer now: the panel
@@ -892,7 +976,7 @@ cmd_tun_down() {
 
 cmd_tun_toggle() {
   local id="${1:-}"
-  if [[ "$(jq -r '.active' <<<"$(read_tun_state)")" == true ]]; then
+  if tun_is_active; then
     cmd_tun_down
   fi
   [[ -n $id ]] || emit_error "tun-toggle needs a profile id when TUN is not active"
@@ -1202,6 +1286,14 @@ cmd_start() {
   local id="${1:-}"
   [[ -n $id ]] || emit_error "start needs a profile id"
   profile_exists "$id" || emit_error "unknown profile: $id"
+  # One engine per set of local ports. While TUN is up the privileged engine owns
+  # 10808/10809, so starting the user-side one would either fail to bind or —
+  # worse — succeed after the TUN engine died, leaving `status` describing a
+  # connection the machine is not actually using. The switch that turns TUN off
+  # is the panel's TUN row (or `tun-down`), so say that instead of starting a
+  # doomed second engine. The command is named as well because this refusal is
+  # also reachable from a terminal, where there is no switch to click.
+  tun_is_active && emit_error "TUN mode is on — turn it off from the TUN switch first, or run 'omarchy-v2ray tun-down'"
   start_profile "$id"
   exit $?
 }
@@ -1226,6 +1318,11 @@ cmd_restart() {
 # is what makes a single click on the bar feel like a VPN switch.
 cmd_toggle() {
   ensure_dirs
+  # Same rule as cmd_start: TUN owns the local ports, and a proxy engine started
+  # underneath it would fight for them and desynchronise `status`. Refusing with
+  # the way out is kinder than a start that dies 10 seconds later; the command is
+  # named too, because this path is what the bar's right-click lands on.
+  tun_is_active && emit_error "TUN mode is on — turn it off from the TUN switch first, or run 'omarchy-v2ray tun-down'"
   if [[ -n "$(read_pid)" ]]; then
     stop_engine
     emit_ok '{"ok":true,"running":false}'

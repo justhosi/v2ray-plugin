@@ -616,6 +616,7 @@ check "status carries every TUN field" jq -e \
 check "with no state, TUN is off and startable" jq -e \
   '.tunActive == false and .tunProfileId == "" and .tunIface == ""
    and .tunSince == 0 and .tunCanStart == true and .tunBlockedReason == ""' <<<"$out"
+check "with nothing running the mode is off" jq -e '.mode == "off"' <<<"$out"
 check "the pre-existing status fields are untouched" jq -e \
   '.installed == true and .engine == "xray" and .running == false
    and .pid == "" and .autostartId == ""' <<<"$out"
@@ -627,6 +628,86 @@ check "status reports the active TUN tunnel" jq -e --arg id "$ID" \
   '.ok == true and .tunActive == true and .tunProfileId == $id
    and .tunIface == "tun0" and .tunSince == 1700000000' <<<"$out"
 check "an active TUN is not startable again" jq -e '.tunCanStart == false' <<<"$out"
+
+# THE SECOND HALF OF THE TUN CONTRACT: while the privileged engine is up it IS
+# the connection. The panel derives `connected` from running/listening/activeId,
+# and its connect button from the same fields, so a status that only described
+# the user-side engine would say "Disconnected" with every packet inside the
+# tunnel — and then let a click start a second engine on the same ports.
+jq -n --arg id "$ID" --arg pid "$$" --argjson since "$(( $(date +%s) - 100 ))" \
+  '{profileId:$id, iface:"omarchy-tun", pid:$pid, since:$since}' >"$TUN_STATE"
+out="$(tun_backend_status)"
+check "an active TUN is reported as the running connection" jq -e --arg id "$ID" '
+  .mode == "tun" and .running == true and .listening == true
+  and .activeId == $id and .activeName == "Test Server"
+  and .socksPort == 10808 and .httpPort == 10809 and .pid != ""' <<<"$out"
+check "its uptime is counted from tunSince, not from the proxy engine" jq -e \
+  '.uptimeSec >= 100 and .uptimeSec < 600' <<<"$out"
+check "and the TUN fields still describe the tunnel" jq -e --arg id "$ID" \
+  '.tunActive == true and .tunProfileId == $id and .tunIface == "omarchy-tun"' <<<"$out"
+
+# Both true at once: TUN wins, and the fields describe the TUN profile — the one
+# whose config the privileged engine is actually running.
+PROXY_PROFILES="$WORK/home/profiles"
+printf '%s' '{"id":"proxy-second","name":"Proxy Second"}' \
+  >"$PROXY_PROFILES/proxy-second.meta.json"
+printf '%s' '{"inbounds":[{"port":20808},{"port":20809}],"outbounds":[]}' \
+  >"$PROXY_PROFILES/proxy-second.config.json"
+PROXY_STATE="$WORK/home/state"
+echo "$$" >"$PROXY_STATE/engine.pid"
+echo "proxy-second" >"$PROXY_STATE/active.id"
+date +%s >"$PROXY_STATE/started.epoch"
+out="$(OMARCHY_V2RAY_TUN_STATE="$WORK/tun/none.json" "$BACKEND" status 2>/dev/null)"
+check "a live proxy engine reports mode proxy" jq -e '
+  .mode == "proxy" and .running == true and .activeId == "proxy-second"
+  and .activeName == "Proxy Second" and .socksPort == 20808' <<<"$out"
+out="$(tun_backend_status)"
+check "TUN wins when both would be true" jq -e --arg id "$ID" '
+  .mode == "tun" and .activeId == $id and .activeName == "Test Server"
+  and .socksPort == 10808 and .httpPort == 10809' <<<"$out"
+
+# Starting the user-side engine underneath a live TUN tunnel would put two
+# engines on 10808/10809: one of them dies, and status would then describe a
+# connection the machine is not using. Refusing must name the way out.
+out="$(OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" "$BACKEND" start "$ID" 2>/dev/null)"
+check "start refuses while TUN is on" jq -e '.ok == false' <<<"$out"
+check_contains "the start refusal points at the TUN switch" \
+  "$(jq -r '.error' <<<"$out")" "TUN switch"
+out="$(OMARCHY_V2RAY_TUN_STATE="$TUN_STATE" "$BACKEND" toggle "$ID" 2>/dev/null)"
+check "toggle refuses while TUN is on" jq -e '.ok == false' <<<"$out"
+check_contains "the toggle refusal points at the TUN switch" \
+  "$(jq -r '.error' <<<"$out")" "TUN switch"
+rm -f "$PROXY_STATE/engine.pid" "$PROXY_STATE/active.id" "$PROXY_STATE/started.epoch"
+
+# The hand-over order is what makes the port collision go away, and it is
+# invisible from outside on a machine without a root-owned helper: assert it
+# where it is written. stop_engine must come before the pkexec hand-off, and
+# after the helper gate — a missing helper must not stop a working tunnel.
+#
+# No comment filter here: this is a bash file, where a full-line comment starts
+# with `#`, not `//`, so the QML-style filter this used to carry removed
+# nothing. The patterns match the real call order either way.
+awk '/^cmd_tun_up\(\)/ { inblock = 1 } inblock { print; if (/^}/) exit }' \
+  "$BACKEND" >"$WORK/tun-up-code"
+check "tun-up stops the user-side engine before launching the helper" \
+  bash -c 'code="$(tr -s "[:space:]" " " <"$1")"; [[ $code == *stop_engine*launch_tun_helper* ]]' \
+  _ "$WORK/tun-up-code"
+check "the helper gate runs before the engine is stopped" \
+  bash -c 'code="$(tr -s "[:space:]" " " <"$1")"; [[ $code == *require_tun_helper*stop_engine* ]]' \
+  _ "$WORK/tun-up-code"
+# ...and a refusal really does leave the proxy engine alone, which is the same
+# property observed from the outside rather than read from the source.
+rm -f "$TUN_STATE"
+echo "$$" >"$PROXY_STATE/engine.pid"
+echo "$ID" >"$PROXY_STATE/active.id"
+out="$(OMARCHY_V2RAY_TUN_HELPER="$WORK/no-such-helper" "$BACKEND" tun-up "$ID" 2>/dev/null)"
+check "tun-up without an installed helper is needsHelper" \
+  jq -e '.ok == false and .needsHelper == true' <<<"$out"
+check "and it leaves the running proxy engine recorded" \
+  test -s "$PROXY_STATE/engine.pid"
+check "and it leaves the active profile recorded" \
+  test -f "$PROXY_STATE/active.id"
+rm -f "$PROXY_STATE/engine.pid" "$PROXY_STATE/active.id"
 
 # v2ray-core has no tun inbound, so TUN must be refused even with a healthy
 # engine installed — and the refusal has to name the package, not just say no.
@@ -895,6 +976,24 @@ panel_failed="$(grep -c '^  FAIL' <<<"$panel_out")" || true
 failures=$(( failures + ${panel_failed:-0} ))
 if (( panel_rc != 0 && ${panel_failed:-0} == 0 )); then
   printf '  FAIL the panel integration test aborted (exit %d)\n' "$panel_rc"
+  failures=$(( failures + 1 ))
+fi
+
+# =============================================================================
+echo
+echo "case 7: the TUN switch's state machine, driven by quickshell"
+# Case 6 proves the credential never reaches argv; this one pins the asynchronous
+# state around a polkit prompt, where both review blockers lived: connect paths
+# that were not gated on `tunArming` (B1) and a stale helper error that cleared
+# the arming before authentication (B2). Like case 6 it needs quickshell and
+# prints SKIP (exit 0) without it. See tests/test-service-tun.sh.
+tun_out="$("$HERE/test-service-tun.sh" 2>&1)"
+tun_rc=$?
+printf '%s\n' "$tun_out"
+tun_failed="$(grep -c '^  FAIL' <<<"$tun_out")" || true
+failures=$(( failures + ${tun_failed:-0} ))
+if (( tun_rc != 0 && ${tun_failed:-0} == 0 )); then
+  printf '  FAIL the TUN state machine test aborted (exit %d)\n' "$tun_rc"
   failures=$(( failures + 1 ))
 fi
 

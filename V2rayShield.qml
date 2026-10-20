@@ -20,6 +20,12 @@ import qs.Ui
 // A small "!" badge (like the one on the Tailscale icon) flags a missing
 // engine, so the user learns the plugin needs a package instead of wondering
 // why nothing happens when they click.
+//
+// TUN vs local proxy: both are "on", and the colour/check mark must keep meaning
+// exactly that, so the difference gets its own quiet mark — a dot under the
+// check — driven by `mode`. Reusing the colour for a second meaning would make
+// "on in TUN mode" and "on as a local proxy" ambiguous at bar size, which is
+// precisely the distinction that matters: one reroutes the whole machine.
 // =============================================================================
 
 Item {
@@ -33,6 +39,10 @@ Item {
   property bool busy: false        // connect/disconnect in flight
   property bool crossed: false     // draw the "off" slash
   property bool warning: false     // no engine installed
+
+  // "tun" | "proxy" | "off". Only "tun" changes the drawing (the dot below);
+  // every other value leaves the long-standing look untouched.
+  property string mode: "off"
 
   width: iconSize
   height: iconSize
@@ -133,6 +143,23 @@ Item {
       PathMove { x: root.width * 0.20; y: root.height * 0.84 }
       PathLine { x: root.width * 0.80; y: root.height * 0.17 }
     }
+  }
+
+  // ---- "TUN mode" mark ------------------------------------------------------
+  // A plain Rectangle rather than another Shape: it is a filled disc, and a
+  // Shape here would be one more PathMove/PathArc pair for the same pixels.
+  // Sits inside the shield's lower point, clear of the check mark above and of
+  // the "!" badge in the bottom-right corner, so it reads at bar size without
+  // touching either existing glyph. Hidden while busy (the whole icon already
+  // pulses) and whenever the shield is off.
+  Rectangle {
+    visible: root.active && root.mode === "tun"
+    width: Math.max(3, Math.round(root.width * 0.16))
+    height: width
+    radius: width / 2
+    color: root.color
+    x: Math.round(root.width * 0.5 - width / 2)
+    y: Math.round(root.height * 0.78 - height / 2)
   }
 
   // ---- "no engine installed" badge --------------------------------------

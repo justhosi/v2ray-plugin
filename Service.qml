@@ -66,6 +66,23 @@ Item {
   property string autostartId: ""       // profile to auto-connect
   property string logTail: ""           // last engine log lines, for errors
 
+  // ---- TUN mode (system-wide; same `status` reply) ------------------------
+  // The TUN engine is a separate, privileged process. `status` merges it into
+  // running/activeId/socksPort/... when it is up (see cmd_status), so
+  // `connected` remains the single answer to "is the tunnel up". These fields
+  // say which KIND of tunnel it is and whether the switch may be used at all.
+  property bool tunActive: false        // is a TUN tunnel up?
+  property string tunProfileId: ""      // profile the TUN engine was started with
+  property string tunIface: ""          // the tun device it created
+  property int tunSince: 0              // epoch the TUN tunnel came up
+  property bool tunCanStart: false      // may the switch offer "on"?
+  property string tunBlockedReason: ""  // why not, in words the user can act on
+  property string tunLastError: ""      // the helper's last failure, if any
+  // "tun" | "proxy" | "off". Kept separate from `connected` because the bar icon
+  // has to tell a local proxy apart from a system-wide tunnel: both are "on",
+  // and only one of them reroutes everything.
+  property string mode: "off"
+
   // ---- imported profiles (mirrors `omarchy-v2ray list`) -------------------
   property var profiles: []
 
@@ -92,6 +109,37 @@ Item {
   // state"; 0/1 means "a toggle is in flight and this is where we're heading".
   property int _pendingRunning: -1
   property bool _autostartChecked: false
+
+  // True between launching a TUN action and the state actually moving. The
+  // helper is detached and authenticates in the background, so the switch
+  // pulses instead of flipping optimistically; a polkit prompt that is
+  // cancelled changes NOTHING, which is what the backstop timer below is for.
+  property bool tunArming: false
+  // How long the backstop waits. A property rather than a literal so the
+  // state-machine test can drive the timeout in a second instead of waiting
+  // half a minute for it.
+  property int tunArmTimeoutMs: 30000
+  // Set when the backend answered needsHelper: the privileged helper is missing
+  // (or not root-owned), so the panel offers `installTun()` instead of a prompt
+  // that cannot work. Not derived from `tunLastError`, because a missing helper
+  // never runs, and therefore never writes an error file.
+  property bool tunNeedsHelper: false
+  property int _tunArmTarget: -1         // 1 = waiting for on, 0 = waiting for off
+  // The helper's last failure as it stood when the current attempt was armed.
+  // Arming may only end on an error that is NEWER than this: the helper deletes
+  // `last-error` only after a SUCCESSFUL start, so on a machine with one past
+  // failure the file stays non-empty through the whole retry, and "non-empty
+  // means this attempt failed" would end the arming before authentication.
+  property string _tunErrorAtArm: ""
+  // The previous tunCanStart, so "became startable" is a transition rather than
+  // a state. The post-refusal status reply already says tunCanStart:true (it
+  // talks about the engine, not the helper), and clearing the install offer on
+  // every such reply would hide it the instant it appeared.
+  property bool _tunCanStartPrev: false
+  // The last tunLastError already painted. Keeping it separate is what lets the
+  // red line be dismissed without status re-surfacing the same sentence on the
+  // next refresh; a DIFFERENT failure still gets through.
+  property string _tunErrorSeen: ""
 
   readonly property bool connected: _pendingRunning === -1 ? (running && listening)
                                                            : (_pendingRunning === 1)
@@ -208,6 +256,21 @@ Item {
     onTriggered: root.toast = ""
   }
 
+  // The backstop for a TUN launch that never comes back. A successful launch is
+  // ended by the next status reply, and a refused one ends on its own; the case
+  // this exists for is a polkit prompt that the user cancels — nobody is left to
+  // write a state file OR an error, so without a timeout the switch would pulse
+  // (and refuse clicks) for the rest of the session.
+  Timer {
+    id: tunArmTimer
+    interval: root.tunArmTimeoutMs
+    onTriggered: {
+      if (!root.tunArming) return
+      root.stopTunArming()
+      root.notice = "TUN did not change — the authorisation prompt may have been cancelled"
+    }
+  }
+
   function showToast(message) {
     toast = String(message)
     toastTimer.restart()
@@ -224,6 +287,11 @@ Item {
     // invalidates it, and leaving it on screen would nag after a successful
     // connect to a server that does not need xray at all.
     needsXray = false
+    // The install offer belongs to the refusal that produced it. The backend's
+    // `tunLastError` is deliberately NOT cleared here: it mirrors a file the
+    // helper owns, and wiping it would only make the next refresh paint the
+    // same sentence again.
+    tunNeedsHelper = false
   }
 
   // ---------------------------------------------------------------------------
@@ -263,6 +331,58 @@ Item {
     uptimeSec = parseInt(String(res.uptimeSec || 0), 10) || 0
     autostartId = String(res.autostartId || "")
     logTail = String(res.logTail || "")
+
+    tunActive = res.tunActive === true
+    tunProfileId = String(res.tunProfileId || "")
+    tunIface = String(res.tunIface || "")
+    tunSince = parseInt(String(res.tunSince || 0), 10) || 0
+    tunCanStart = res.tunCanStart === true
+    tunBlockedReason = String(res.tunBlockedReason || "")
+    tunLastError = String(res.tunLastError || "")
+    // `mode` is newer than the rest of the contract, so it is derived when an
+    // older backend (a shell that has not been restarted since an update)
+    // answers without it — the alternative would be painting a live TUN tunnel
+    // as "off".
+    mode = String(res.mode || (tunActive ? "tun"
+                               : ((running && listening) ? "proxy" : "off")))
+
+    // A TUN launch is asynchronous, so the switch waits for the state to move
+    // rather than flipping on the click. Arming ends ONLY on evidence about
+    // THIS attempt: the state arrived, or the helper reported something it had
+    // not already said when the attempt was armed. A plain "error is non-empty"
+    // test is wrong here — see _tunErrorAtArm.
+    if (tunArming) {
+      if (_tunArmTarget !== -1 && tunActive === (_tunArmTarget === 1)) {
+        stopTunArming()
+      } else if (tunLastError !== "" && tunLastError !== _tunErrorAtArm) {
+        stopTunArming()
+      }
+    }
+
+    // The helper's own words are the only account of a failed TUN start (nobody
+    // is there to return JSON: it runs detached, as root, minutes later). Paint
+    // them the first time they CHANGE, through the same red line — and the same
+    // copy-details button — as every other failure.
+    if (tunLastError !== "") {
+      if (tunLastError !== _tunErrorSeen) {
+        _tunErrorSeen = tunLastError
+        lastError = tunLastError
+        lastErrorDetails = tunLastError
+      }
+    } else {
+      // The helper deletes its error file on a successful start, so an empty
+      // value is the reset: the same failure may be reported again later.
+      _tunErrorSeen = ""
+    }
+
+    // The install offer is about the LAST needsHelper refusal. It is cleared by
+    // a new action (clearMessages) and when TUN becomes startable again — at
+    // which point either the helper was installed or the tunnel came down, and
+    // in both cases the row has served its purpose. The transition matters: the
+    // status reply that follows the refusal itself carries tunCanStart:true.
+    if (tunCanStart && !_tunCanStartPrev) tunNeedsHelper = false
+    _tunCanStartPrev = tunCanStart
+
     // The real state has caught up with any optimistic guess.
     if (running === (_pendingRunning === 1) && listening === running) _pendingRunning = -1
     maybeAutostart()
@@ -300,11 +420,21 @@ Item {
   // child's stdin before that pipe is closed. Only the import path passes one:
   // its payload is a secret, and stdin is the one channel a process does not
   // publish to the rest of the machine.
+  //
+  // Returns true when the child was started, false when another action is still
+  // in flight. Callers that arm something BEFORE waiting for an async answer
+  // (the TUN switch) must not arm on false: nothing was launched, so nothing
+  // will ever arrive to clear it.
   function runAction(command, rowId, stdinPayload) {
-    if (actionProc.running) return
+    if (actionProc.running) return false
     clearMessages()
     busy = true
     actionRowId = String(rowId || "")
+    // Which backend action this is, kept for onExited: the rows show a spinner
+    // from `actionRowId`, but only a profile edit should toast "Updated <row>".
+    // A TUN launch passes the profile id as well (so the row does show it is
+    // busy) and must not claim the profile was changed.
+    _actionVerb = command.length > 2 ? String(command[2]) : ""
     // Park the payload where onStarted can pick it up; it is dropped again the
     // moment it has been written, so the secret is not kept in a property.
     _actionStdin = (stdinPayload === undefined || stdinPayload === null)
@@ -315,20 +445,52 @@ Item {
     actionProc.stdinEnabled = _actionStdin !== ""
     actionProc.command = command
     actionProc.running = true
+    return true
+  }
+
+  // The message every proxy-connect refusal uses while a TUN launch is waiting
+  // for polkit. The gate itself sits in connect() and toggleConnection(), which
+  // between them are the ONLY ways into `start`: a row click and the cursor's
+  // Enter reach connect() directly, the bar's right-click and the `t` key reach
+  // toggleConnection(). `busy` cannot stand in for this — it tracks the
+  // launcher, which exits in milliseconds — and the backend cannot refuse yet
+  // either (tun_is_active is still false), so without the gate a connect click
+  // would start a proxy engine on the ports the TUN engine is about to claim.
+  function tunStartingMessage() {
+    return "TUN is starting — waiting for authorisation"
   }
 
   function connect(id) {
     if (!id) return
+    if (tunArming) {
+      lastError = tunStartingMessage()
+      return
+    }
     _pendingRunning = 1
     runAction(["bash", scriptPath, "start", String(id)], String(id))
   }
 
   function disconnect() {
+    // While TUN is up, the thing carrying traffic is not this proxy engine:
+    // `stop` would kill nothing, the switch would flip off optimistically and
+    // then flip back at the next status refresh. "Disconnect" means the tunnel
+    // goes away, so it takes the privileged route when that is what is running.
+    if (tunActive) {
+      tunDown()
+      return
+    }
     _pendingRunning = 0
     runAction(["bash", scriptPath, "stop"], "")
   }
 
   function toggleConnection() {
+    // Same window as connect(): the switch looks idle long before polkit has
+    // answered, so refuse here too rather than letting the connect path below
+    // start an engine that would fight the one TUN is about to start.
+    if (tunArming) {
+      lastError = tunStartingMessage()
+      return
+    }
     if (connected) {
       disconnect()
       return
@@ -360,6 +522,81 @@ Item {
 
   function setAutostart(id) {
     runAction(["bash", scriptPath, "autostart", String(id)], String(id))
+  }
+
+  // ---------------------------------------------------------------------------
+  // TUN mode (system-wide)
+  // ---------------------------------------------------------------------------
+  // The privileged half runs detached behind a polkit prompt, so these calls
+  // return as soon as the launcher has handed over — `runAction`'s `busy` clears
+  // on the child's exit, which is milliseconds later, NOT when the password is
+  // accepted. Anything that has to survive the prompt therefore lives in
+  // `tunArming` and is cleared by the next status reply (or the backstop timer).
+  //
+  // The profile id still goes to runAction as the row id: the list row shows its
+  // spinner for the moment the hand-off takes, which is the only feedback before
+  // polkit paints its own dialog.
+
+  function armTun(target) {
+    _tunArmTarget = target
+    // Snapshot the helper's previous failure BEFORE the attempt starts; see the
+    // declaration of _tunErrorAtArm for why an empty test is not enough.
+    _tunErrorAtArm = tunLastError
+    tunArming = true
+    tunArmTimer.restart()
+  }
+
+  function stopTunArming() {
+    tunArming = false
+    _tunArmTarget = -1
+    _tunErrorAtArm = ""
+    tunArmTimer.stop()
+  }
+
+  function tunUp(id) {
+    if (!id) return
+    // One authorisation at a time: the switch is disabled while arming, but the
+    // `u` shortcut is not, and a second pkexec would only be refused by the
+    // helper's own lock after a second password prompt.
+    if (tunArming) return
+    // Arm only when the launcher really started. runAction refuses while another
+    // action is in flight, and arming on a refused call would pulse "Waiting for
+    // authorisation…" (and swallow every click) for 30 s after nothing happened.
+    if (!runAction(["bash", scriptPath, "tun-up", String(id)], id)) return
+    armTun(1)
+  }
+
+  function tunDown() {
+    if (tunArming) return
+    // Same rule as tunUp: arm only once the launcher has actually started.
+    if (!runAction(["bash", scriptPath, "tun-down"], "")) return
+    armTun(0)
+  }
+
+  // What the panel's TUN switch and the `u` shortcut call. Turning TUN ON needs
+  // a profile: the same "last one, else the autostart pick, else the only one"
+  // rule the proxy switch uses, so a single-server setup needs no choices.
+  function tunToggle() {
+    if (tunArming) return
+    if (tunActive) {
+      tunDown()
+      return
+    }
+    if (!tunCanStart) {
+      clearMessages()
+      lastError = tunBlockedReason !== ""
+        ? tunBlockedReason
+        : "TUN mode is not available on this machine"
+      return
+    }
+    var target = activeId || autostartId
+    if (!target && profiles.length === 1) target = profiles[0].id
+    if (!target) {
+      clearMessages()
+      lastError = "Import a server first"
+      return
+    }
+    tunUp(target)
   }
 
   // ---------------------------------------------------------------------------
@@ -478,6 +715,17 @@ Item {
     notice = "Installing xray in a terminal window — the bar icon updates when it finishes"
   }
 
+  // The privileged TUN helper. Same reason as the two above: `install-tun` runs
+  // pkexec from a terminal the user can watch, and the shell process itself can
+  // never prompt. Nothing is polled afterwards — the terminal IS the progress
+  // report, and the switch works the next time it is pressed.
+  function installTun() {
+    clearMessages()
+    Quickshell.execDetached(["bash", scriptPath, "install-tun"])
+    showToast("Installing the TUN helper…")
+    notice = "Installing the TUN helper in a terminal window — the TUN switch works once it finishes"
+  }
+
   function revealConfig() {
     Quickshell.execDetached(["bash", scriptPath, "reveal"])
   }
@@ -539,6 +787,9 @@ Item {
   // one JSON object, refresh", and serialising them keeps state predictable.
   property string _actionOut: ""
   property string _actionErr: ""
+  // Which subcommand this action is (command[2]), so onExited can tell a
+  // profile edit from a TUN launch. See runAction().
+  property string _actionVerb: ""
   // Import payload waiting to be written to the child's stdin. Empty for every
   // other action, and always cleared once written. See runAction().
   property string _actionStdin: ""
@@ -574,6 +825,10 @@ Item {
       var res = root.parseJson(root._actionOut)
       var wasImport = root.importingId !== ""
       var failedRow = root.actionRowId
+      var verb = root._actionVerb
+      // A TUN launch is asynchronous: a successful one keeps pulsing until
+      // status sees the state move, but a refused one has nothing to wait for.
+      var wasTun = verb === "tun-up" || verb === "tun-down"
 
       root.busy = false
       root.actionRowId = ""
@@ -595,7 +850,9 @@ Item {
             root.lastError = "That server uses " + String(res.needsXrayReason || "REALITY") +
               ", which v2ray cannot do — install xray from the AUR."
           }
-        } else if (failedRow !== "") {
+        } else if (failedRow !== "" && !wasTun) {
+          // Only profile edits toast here. A TUN launch carries the profile id
+          // too (for the row spinner) but changed nothing about that profile.
           root.showToast("Updated " + failedRow)
         }
         root.lastError = ""
@@ -610,6 +867,10 @@ Item {
           // The backend already spelled out the fix; we only turn the flag on so
           // the panel can offer a one-click "Install xray" button beside it.
           root.needsXray = true
+        } else if (res.needsHelper === true) {
+          // No password prompt was attempted at all. The panel turns this into
+          // an "install the helper" button rather than failing silently.
+          root.tunNeedsHelper = true
         }
       } else {
         var detail = String(root._actionErr || "").trim()
@@ -618,8 +879,15 @@ Item {
         root.lastErrorDetails = detail
       }
 
+      // A launched TUN action keeps arming until status sees the state move; a
+      // REFUSED one has nothing to wait for, and that includes needsHelper (the
+      // helper was never executed, so no state file and no error file will ever
+      // arrive for this attempt).
+      if (wasTun && !(res && res.ok === true)) root.stopTunArming()
+
       root.importingId = ""
       root.importingName = ""
+      root._actionVerb = ""
       root.refresh()
     }
   }
